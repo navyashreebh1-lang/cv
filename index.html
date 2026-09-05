@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AGRIVISION - Plant Detection System</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">🌾 AGRIVISION</div>
+            <div class="subtitle">AI VISION SYSTEM</div>
+        </div>
+        <div class="header-center">
+            <div class="mode-badge" id="modeBadge">LIVE MODE</div>
+        </div>
+        <div class="header-right">
+            <div class="status-indicator" id="statusIndicator">
+                <span class="status-dot"></span>
+                <span class="status-text">INITIALIZING</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <div class="container">
+        <!-- Camera Panel -->
+        <div class="main-panel">
+            <div class="camera-wrapper">
+                <video id="cameraFeed" class="camera-feed" playsinline autoplay></video>
+                <canvas id="detectionCanvas" class="detection-canvas"></canvas>
+                <div class="camera-overlay" id="cameraOverlay">
+                    <div class="overlay-message">
+                        <div class="spinner"></div>
+                        <p>Initializing Camera...</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Camera Controls -->
+            <div class="camera-controls">
+                <button id="startCameraBtn" class="btn btn-primary">
+                    <span class="btn-icon">▶</span> START CAMERA
+                </button>
+                <button id="stopCameraBtn" class="btn btn-secondary" disabled>
+                    <span class="btn-icon">⏹</span> STOP CAMERA
+                </button>
+                <button id="startDetectionBtn" class="btn btn-success" disabled>
+                    <span class="btn-icon">⚡</span> START DETECTION
+                </button>
+                <button id="stopDetectionBtn" class="btn btn-danger" disabled>
+                    <span class="btn-icon">◼</span> STOP DETECTION
+                </button>
+            </div>
+
+            <!-- Simulation Mode Toggle -->
+            <div class="simulation-toggle">
+                <label class="checkbox-container">
+                    <input type="checkbox" id="simulationModeToggle">
+                    <span class="checkbox-label">SIMULATION MODE</span>
+                </label>
+            </div>
+
+            <!-- Stats Row -->
+            <div class="stats-row">
+                <div class="stat-item">
+                    <span class="stat-label">Camera FPS</span>
+                    <span class="stat-value" id="cameraFpsValue">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Inference FPS</span>
+                    <span class="stat-value" id="inferenceFpsValue">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Inference Time</span>
+                    <span class="stat-value" id="inferenceTimeValue">0 ms</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Model</span>
+                    <span class="stat-value" id="modelValue">--</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Sidebar -->
+        <div class="sidebar">
+            <!-- System Status -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h3 class="panel-title">⚙️ SYSTEM STATUS</h3>
+                </div>
+                <div class="status-list">
+                    <div class="status-item">
+                        <span class="status-label">Camera</span>
+                        <span class="status-badge" id="cameraStatus">OFFLINE</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">AI Engine</span>
+                        <span class="status-badge" id="aiStatus">LOADING</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Detection</span>
+                        <span class="status-badge" id="detectionStatus">PAUSED</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Mode</span>
+                        <span class="status-badge" id="modeStatus">LIVE</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Detection Status -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h3 class="panel-title">🔍 DETECTION STATUS</h3>
+                </div>
+                <div class="detection-summary" id="detectionSummary">
+                    <div class="summary-indicator offline">
+                        <span class="indicator-dot"></span>
+                        <span class="indicator-text">NO DETECTION</span>
+                    </div>
+                    <div class="summary-stat">
+                        <span class="summary-label">Plants Detected</span>
+                        <span class="summary-value" id="plantCountValue">0</span>
+                    </div>
+                    <div class="summary-stat">
+                        <span class="summary-label">Highest Confidence</span>
+                        <span class="summary-value" id="highestConfValue">--</span>
+                    </div>
+                    <div class="summary-stat">
+                        <span class="summary-label">Average Confidence</span>
+                        <span class="summary-value" id="avgConfValue">--</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Detections List -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h3 class="panel-title">📋 DETECTIONS</h3>
+                </div>
+                <div class="detections-list" id="detectionsList">
+                    <div class="empty-state">
+                        No plants detected
+                    </div>
+                </div>
+            </div>
+
+            <!-- Info Panel -->
+            <div class="panel info-panel">
+                <div class="panel-header">
+                    <h3 class="panel-title">ℹ️ STAGE 1 PROTOTYPE</h3>
+                </div>
+                <p class="info-text">
+                    Plant Detection System v1.0
+                </p>
+                <p class="info-text small">
+                    Stage 1: Plant Detection<br>
+                    Future: Crop ID, Disease Detection, GPS Integration
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- TensorFlow.js + COCO-SSD (fallback) and tfjs-tflite (custom plant detector).
+         Versions are pinned deliberately, not just for reproducibility:
+         @tensorflow/tfjs-tflite never left alpha (last published 0.0.1-alpha.10 in
+         2023) and declares an exact peer dependency on tfjs-core@4.9.0, while
+         coco-ssd@2.2.3 requires tfjs-core^4.10.0 - loading unpinned "latest" tags
+         mixed a 2023 alpha WASM plugin against a tfjs-core two years newer than what
+         it was built against, which is a known source of silent load failures/hangs
+         in tfjs-tflite. 4.10.0 is the closest core version that satisfies coco-ssd's
+         declared range while staying one minor version from what tfjs-tflite tested. -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/dist/tf-tflite.min.js"></script>
+
+    <!-- Application Script -->
+    <script src="script.js"></script>
+</body>
+</html>
