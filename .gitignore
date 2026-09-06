@@ -1,0 +1,9 @@
+# Model 2 training artefacts - datasets and checkpoints are large and
+# reproducible from training/plant_health/scripts/.
+training/plant_health/dataset/raw/
+training/plant_health/dataset/work/
+training/plant_health/dataset/ood/
+training/plant_health/models/*.keras
+training/plant_health/models/export/*.tflite
+__pycache__/
+*.pyc

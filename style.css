@@ -23,69 +23,211 @@
     --border-color: #475569;
     --success: #10b981;
     --offline: #64748b;
+    --debug-blue: #60a5fa;
+    --debug-blue-dim: #93c5fd;
+
+    /* ---- Glassmorphism system --------------------------------------------
+       Deep agri-tech ground + translucent glass surfaces. Card alpha is kept
+       high enough (~0.6) that every label stays fully legible over the dark
+       background even where backdrop-filter is unsupported. */
+    --glass-bg: rgba(20, 32, 44, 0.62);
+    --glass-bg-strong: rgba(17, 27, 38, 0.82);   /* for elements over the video */
+    --glass-border: rgba(148, 197, 175, 0.16);
+    --glass-highlight: rgba(255, 255, 255, 0.06);
+    --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.38), 0 1px 0 var(--glass-highlight) inset;
+    --glass-shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.5), 0 1px 0 var(--glass-highlight) inset;
+    --blur: 14px;
+    --radius: 14px;
+    --radius-sm: 10px;
+    --accent-glow: 0 0 0 1px rgba(16, 185, 129, 0.25), 0 6px 24px rgba(16, 185, 129, 0.14);
+}
+
+html {
+    -webkit-text-size-adjust: 100%;   /* stop iOS bumping font sizes on rotate */
+    text-size-adjust: 100%;
 }
 
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-    background-color: var(--bg-darker);
     color: var(--text-primary);
     line-height: 1.6;
-    overflow: hidden;
+    /* Deep charcoal-green agri-tech ground. `fixed` so the gradient stays put
+       while the page scrolls (no repaint jank). Solid base colour first as a
+       fallback. */
+    background-color: #060b10;
+    background-image:
+        radial-gradient(1200px 800px at 12% -10%, rgba(16, 185, 129, 0.10), transparent 60%),
+        radial-gradient(1000px 700px at 108% 8%, rgba(6, 182, 212, 0.08), transparent 55%),
+        linear-gradient(180deg, #071019 0%, #05090d 55%, #04070a 100%);
+    background-attachment: fixed;
+    /* Mobile-first: the page is a scrollable column. The old `overflow:hidden`
+       locked everything to one viewport, so on a phone every card below the
+       camera was unreachable. Desktop still fills the viewport (see the
+       >=1025px block) but is now allowed to grow if it must. */
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    min-height: 100dvh;
+    overflow-x: hidden;              /* belt-and-suspenders: never scroll sideways */
 }
 
-/* Header */
+/* ---- Background depth orbs -------------------------------------------------
+   Big, soft, very low-opacity blobs sitting behind everything. One slow drift,
+   disabled under prefers-reduced-motion. pointer-events:none so they never
+   interfere with taps or the camera. */
+.bg-orbs {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    overflow: hidden;
+    pointer-events: none;
+}
+
+.orb {
+    position: absolute;
+    display: block;
+    border-radius: 50%;
+    filter: blur(70px);
+    opacity: 0.5;
+    will-change: transform;
+}
+
+.orb--1 {
+    width: 46vmax;
+    height: 46vmax;
+    top: -18vmax;
+    left: -12vmax;
+    background: radial-gradient(circle at 30% 30%, rgba(16, 185, 129, 0.28), transparent 70%);
+    animation: orb-drift-1 34s ease-in-out infinite alternate;
+}
+
+.orb--2 {
+    width: 38vmax;
+    height: 38vmax;
+    bottom: -16vmax;
+    right: -12vmax;
+    background: radial-gradient(circle at 60% 40%, rgba(6, 182, 212, 0.22), transparent 70%);
+    animation: orb-drift-2 40s ease-in-out infinite alternate;
+}
+
+.orb--3 {
+    width: 30vmax;
+    height: 30vmax;
+    top: 40%;
+    left: 55%;
+    background: radial-gradient(circle at 50% 50%, rgba(52, 211, 153, 0.14), transparent 70%);
+    animation: orb-drift-3 46s ease-in-out infinite alternate;
+}
+
+@keyframes orb-drift-1 { to { transform: translate3d(6vmax, 4vmax, 0) scale(1.08); } }
+@keyframes orb-drift-2 { to { transform: translate3d(-5vmax, -6vmax, 0) scale(1.1); } }
+@keyframes orb-drift-3 { to { transform: translate3d(-4vmax, 3vmax, 0) scale(0.92); } }
+
+/* Media never forces horizontal overflow, whatever its intrinsic size. */
+img,
+video,
+canvas {
+    max-width: 100%;
+}
+
+/* Keyboard focus is visible on every interactive control (accessibility). */
+.btn:focus-visible,
+a:focus-visible {
+    outline: 3px solid var(--secondary-color);
+    outline-offset: 2px;
+}
+
+/* Respect a user's reduced-motion preference - kill the decorative loops. */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+    }
+}
+
+/* Header - compact on phones, roomy on desktop. Wraps instead of stacking so
+   it never gets tall, and never overflows because every child can wrap. */
 .header {
+    flex: 0 0 auto;
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    padding: 1rem 1.5rem;
-    background: linear-gradient(135deg, var(--surface-dark) 0%, rgba(15, 23, 42, 0.8) 100%);
-    border-bottom: 1px solid var(--border-color);
-    gap: 2rem;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem 1rem;
+    padding: 0.6rem clamp(0.9rem, 3vw, 1.5rem);
+    padding-top: max(0.6rem, env(safe-area-inset-top));
+    /* Glass bar: translucent, blurred, hairline underline. position:sticky
+       keeps it pinned as the mobile column scrolls. */
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: linear-gradient(135deg, rgba(22, 34, 46, 0.72) 0%, rgba(11, 18, 26, 0.6) 100%);
+    backdrop-filter: blur(16px) saturate(140%);
+    -webkit-backdrop-filter: blur(16px) saturate(140%);
+    border-bottom: 1px solid var(--glass-border);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.28);
 }
 
 .header-left {
     display: flex;
-    align-items: center;
-    gap: 1rem;
+    align-items: baseline;
+    gap: 0.6rem;
+    min-width: 0;
 }
 
 .logo {
-    font-size: 1.5rem;
+    font-size: clamp(1.1rem, 4.5vw, 1.5rem);
     font-weight: 700;
-    color: var(--primary-color);
     letter-spacing: 0.5px;
+    white-space: nowrap;
+    background: linear-gradient(120deg, #34d399 0%, #10b981 45%, #22d3ee 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
 }
 
 .subtitle {
-    font-size: 0.75rem;
+    font-size: 0.7rem;
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 1px;
     font-weight: 600;
+    white-space: nowrap;
 }
 
 .header-center {
-    flex: 1;
     display: flex;
     justify-content: center;
 }
 
 .mode-badge {
-    padding: 0.5rem 1rem;
-    background-color: var(--primary-color);
-    color: white;
-    font-size: 0.875rem;
-    font-weight: 600;
-    border-radius: 0.375rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.35rem 0.8rem;
+    color: #d1fae5;
+    font-size: clamp(0.7rem, 2.6vw, 0.875rem);
+    font-weight: 700;
+    border-radius: 999px;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
-    box-shadow: 0 0 15px rgba(16, 185, 129, 0.3);
+    letter-spacing: 0.6px;
+    white-space: nowrap;
+    background: rgba(16, 185, 129, 0.14);
+    border: 1px solid rgba(16, 185, 129, 0.35);
+    box-shadow: 0 0 18px rgba(16, 185, 129, 0.18);
 }
 
-.mode-badge.simulation {
-    background-color: var(--warning-color);
-    box-shadow: 0 0 15px rgba(245, 158, 11, 0.3);
+.mode-badge::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--primary-color);
+    box-shadow: 0 0 8px var(--primary-color);
+    animation: pulse 2s infinite;
 }
 
 .header-right {
@@ -97,8 +239,9 @@ body {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    font-size: 0.875rem;
+    font-size: clamp(0.7rem, 2.6vw, 0.875rem);
     font-weight: 600;
+    white-space: nowrap;
 }
 
 .status-dot {
@@ -123,50 +266,79 @@ body {
     letter-spacing: 0.5px;
 }
 
-/* Main Container */
+/* Main Container.
+   MOBILE-FIRST: a single scrollable column. `.main-panel` and `.sidebar` are
+   display:contents here, so their children become direct items of this column
+   and can be ordered freely (see the `order:` values below) to give the exact
+   mobile hierarchy: camera -> controls -> detection status -> system status ->
+   detections -> model info -> stats.
+   The two-column desktop dashboard is rebuilt in the >=1025px block. */
 .container {
-    display: flex;
-    height: calc(100vh - 70px);
-    gap: 1.5rem;
-    padding: 1.5rem;
-}
-
-/* Main Panel - Camera Area */
-.main-panel {
-    flex: 1;
+    flex: 1 1 auto;
     display: flex;
     flex-direction: column;
     gap: 1rem;
+    padding: clamp(0.75rem, 3vw, 1.5rem);
+    padding-bottom: max(clamp(0.75rem, 3vw, 1.5rem), env(safe-area-inset-bottom));
+    width: 100%;
+    min-width: 0;
+}
+
+.main-panel,
+.sidebar {
+    display: contents;
+}
+
+.main-panel > *,
+.sidebar > * {
     min-width: 0;
 }
 
 .camera-wrapper {
-    flex: 1;
+    order: 1;
     position: relative;
-    background-color: var(--surface-dark);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
+    width: 100%;
+    /* MOBILE-FIRST height. Deliberately COMPACT (~180-236px on phones) so the
+       detection result and the plant-health card sit within the first
+       viewport - the user should not have to scroll to see whether a plant was
+       detected. Always has a height even before the stream loads, so the layout
+       never jumps. `object-fit: contain` (below) keeps the feed undistorted
+       inside this box. Tablet and desktop restore a larger preview in their
+       own blocks. */
+    height: clamp(180px, 50vw, 236px);
+    /* Near-opaque dark ground so the letterbox bars stay clean and the feed is
+       never washed out - the glass treatment is on the FRAME, not the feed. */
+    background-color: #04070a;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
     overflow: hidden;
     display: flex;
     align-items: center;
     justify-content: center;
+    box-shadow:
+        var(--glass-shadow-lg),
+        0 0 0 1px rgba(16, 185, 129, 0.12),
+        0 0 40px rgba(16, 185, 129, 0.06);
 }
 
+/* Video and canvas are the SAME intrinsic size (JS sets the canvas to the
+   video's native pixels) and share the SAME object-fit, so they letterbox
+   identically -> the detection boxes stay pixel-aligned with the video.
+   `contain` instead of `cover` = nothing important is cropped out of view. */
 .camera-feed {
     width: 100%;
     height: 100%;
-    object-fit: cover;
+    object-fit: contain;
     display: block;
 }
 
 .detection-canvas {
     position: absolute;
-    top: 0;
-    left: 0;
+    inset: 0;
     width: 100%;
     height: 100%;
-    object-fit: cover;
-    cursor: crosshair;
+    object-fit: contain;
+    pointer-events: none;
 }
 
 .camera-overlay {
@@ -175,7 +347,9 @@ body {
     left: 0;
     width: 100%;
     height: 100%;
-    background-color: rgba(2, 6, 23, 0.9);
+    background-color: rgba(4, 8, 12, 0.82);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -184,6 +358,255 @@ body {
 
 .camera-overlay.hidden {
     display: none;
+}
+
+/* A confirmed-but-weak plant: still counted, but flagged so a thin detection
+   is never presented as a solid one. */
+.weak-badge {
+    display: inline-block;
+    margin-left: 0.35rem;
+    padding: 0.05rem 0.3rem;
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    border-radius: 0.2rem;
+    color: var(--bg-darker);
+    background: var(--warning-color);
+    vertical-align: middle;
+}
+
+/* ---- Model 2: per-plant analysis card inside a detection item ---------- */
+.detection-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.analysis {
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px dashed var(--glass-border);
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+}
+
+.analysis-off {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.analysis-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.75rem;
+}
+
+.analysis-key {
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.68rem;
+}
+
+.analysis-val {
+    color: var(--text-primary);
+    font-weight: 600;
+    text-align: right;
+}
+
+.analysis-val em {
+    font-style: normal;
+    font-weight: 400;
+    color: var(--text-muted);
+    margin-left: 0.3rem;
+}
+
+.analysis-val.is-healthy { color: var(--primary-color); }
+.analysis-val.is-unhealthy { color: var(--warning-color); }
+
+.analysis-uncertain {
+    color: var(--warning-color);
+}
+
+.analysis-title {
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    font-size: 0.72rem;
+}
+
+.analysis-note {
+    color: var(--text-muted);
+    font-size: 0.68rem;
+}
+
+/* Blue live diagnostics overlay - top-left inside the camera wrapper.
+   z-index 6: above the detection canvas, below the no-plant popup (8) and the
+   init/error overlay (10). pointer-events:none so it never intercepts clicks,
+   and it is deliberately narrow + translucent so it can't hide a plant box. */
+.debug-overlay {
+    position: absolute;
+    top: 0.75rem;
+    left: 0.75rem;
+    z-index: 6;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    padding: 0.6rem 0.8rem;
+    max-width: 62%;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+    line-height: 1.35;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--debug-blue);
+    background: rgba(6, 12, 20, 0.5);
+    backdrop-filter: blur(10px) saturate(130%);
+    -webkit-backdrop-filter: blur(10px) saturate(130%);
+    border: 1px solid rgba(96, 165, 250, 0.28);
+    border-left: 3px solid var(--debug-blue);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.35);
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+    pointer-events: none;
+}
+
+.debug-overlay[hidden] {
+    display: none;
+}
+
+.debug-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 1.25rem;
+    white-space: nowrap;
+}
+
+.debug-label {
+    color: var(--debug-blue-dim);
+}
+
+.debug-value {
+    color: var(--debug-blue);
+    font-weight: 700;
+}
+
+/* The status line is the headline read - green when plants are counted,
+   amber when the frame has none, so it matches the popup state at a glance. */
+.debug-status {
+    margin-top: 0.2rem;
+    padding-top: 0.3rem;
+    border-top: 1px solid rgba(96, 165, 250, 0.25);
+}
+
+.debug-status .debug-value.has-plants {
+    color: var(--primary-color);
+}
+
+.debug-status .debug-value.no-plants {
+    color: var(--warning-color);
+}
+
+/* Debug overlay on small screens: smaller type + tighter spacing, all rows
+   kept. Still translucent + pointer-events:none, so it never blocks the view. */
+@media (max-width: 767px) {
+    .debug-overlay {
+        top: 0.4rem;
+        left: 0.4rem;
+        padding: 0.4rem 0.55rem;
+        font-size: 0.58rem;
+        line-height: 1.3;
+        gap: 0.05rem;
+        max-width: 60%;
+        border-left-width: 2px;
+    }
+    .debug-row { gap: 0.6rem; }
+    .debug-status { margin-top: 0.1rem; padding-top: 0.2rem; }
+}
+
+@media (max-width: 400px) {
+    .debug-overlay { font-size: 0.52rem; max-width: 66%; }
+}
+
+/* "NO PLANT DETECTED" live popup - overlays the video area, below the
+   init/error camera-overlay (z-index 10) so a stopped camera still wins.
+   pointer-events: none so it never blocks the canvas / controls. */
+.no-plant-popup {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 8;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 1.5rem 2.25rem;
+    min-width: 260px;
+    max-width: 80%;
+    text-align: center;
+    background: linear-gradient(135deg, rgba(38, 26, 8, 0.78), rgba(12, 12, 16, 0.82));
+    border: 1px solid rgba(245, 158, 11, 0.45);
+    border-left: 4px solid var(--warning-color);
+    border-radius: var(--radius);
+    box-shadow:
+        0 16px 48px rgba(0, 0, 0, 0.6),
+        0 0 0 1px rgba(245, 158, 11, 0.18),
+        0 0 30px rgba(245, 158, 11, 0.12);
+    backdrop-filter: blur(10px) saturate(140%);
+    -webkit-backdrop-filter: blur(10px) saturate(140%);
+    pointer-events: none;
+    animation: no-plant-pop 160ms ease-out;
+}
+
+.no-plant-popup[hidden] {
+    display: none;
+}
+
+@keyframes no-plant-pop {
+    from { opacity: 0; transform: translate(-50%, -50%) scale(0.94); }
+    to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+
+.no-plant-icon {
+    font-size: 2rem;
+    line-height: 1;
+}
+
+.no-plant-title {
+    font-size: 1.15rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--warning-color);
+}
+
+.no-plant-message {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+/* Popup on small screens: shrink so it sits WITHIN the camera frame, never
+   covering it edge to edge, and never wider than the frame. */
+@media (max-width: 767px) {
+    .no-plant-popup {
+        min-width: 0;
+        width: max-content;
+        max-width: min(88%, 320px);
+        padding: 0.85rem 1.1rem;
+        gap: 0.3rem;
+    }
+    .no-plant-icon { font-size: 1.5rem; }
+    .no-plant-title { font-size: 0.9rem; letter-spacing: 0.05em; }
+    .no-plant-message { font-size: 0.72rem; }
+}
+
+/* Very short camera frame (landscape phone): keep the popup one tight line-set. */
+@media (max-height: 480px) {
+    .no-plant-popup { padding: 0.6rem 0.9rem; }
+    .no-plant-icon { font-size: 1.25rem; }
 }
 
 .overlay-message {
@@ -213,29 +636,46 @@ body {
     to { transform: rotate(360deg); }
 }
 
-/* Controls */
+/* Controls.
+   MOBILE: a 2-column grid - [START CAM][STOP CAM] / [START DET][STOP DET].
+   Each button is a >=48px touch target. Larger screens switch to one row
+   (see the >=768px block). */
 .camera-controls {
-    display: flex;
-    gap: 0.75rem;
-    flex-wrap: wrap;
+    order: 2;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.6rem;
 }
 
 .btn {
-    flex: 1;
-    min-width: 180px;
-    padding: 0.75rem 1rem;
-    border: none;
-    border-radius: 0.375rem;
-    font-size: 0.875rem;
-    font-weight: 600;
+    min-width: 0;
+    min-height: 48px;
+    padding: 0.75rem 0.75rem;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    font-size: clamp(0.75rem, 2.7vw, 0.875rem);
+    font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.4px;
     cursor: pointer;
-    transition: all 0.3s ease;
+    transition: transform 0.12s ease, background-color 0.2s ease,
+                border-color 0.2s ease, box-shadow 0.2s ease;
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 0.5rem;
+    gap: 0.4rem;
+    text-align: center;
+    /* Glass fill: translucent surface + blur, so buttons read as part of the
+       same material as the cards. The accent colour lives in the tint + border. */
+    color: var(--text-primary);
+    background: var(--glass-bg);
+    backdrop-filter: blur(8px) saturate(130%);
+    -webkit-backdrop-filter: blur(8px) saturate(130%);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25), 0 1px 0 var(--glass-highlight) inset;
+}
+
+.btn:active:not(:disabled) {
+    transform: translateY(1px) scale(0.985);
 }
 
 .btn-icon {
@@ -243,136 +683,129 @@ body {
 }
 
 .btn:disabled {
-    opacity: 0.5;
+    opacity: 0.42;
     cursor: not-allowed;
 }
 
-.btn-primary {
-    background-color: var(--primary-color);
-    color: white;
+.btn-primary,
+.btn-success {
+    color: #eafff5;
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.32), rgba(5, 150, 105, 0.22));
+    border-color: rgba(16, 185, 129, 0.45);
 }
 
-.btn-primary:hover:not(:disabled) {
-    background-color: var(--primary-dark);
-    box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+.btn-primary:hover:not(:disabled),
+.btn-success:hover:not(:disabled) {
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.48), rgba(5, 150, 105, 0.34));
+    border-color: rgba(52, 211, 153, 0.7);
+    box-shadow: 0 6px 20px rgba(16, 185, 129, 0.28), 0 1px 0 var(--glass-highlight) inset;
 }
 
 .btn-secondary {
-    background-color: var(--surface-light);
     color: var(--text-primary);
+    background: rgba(51, 65, 85, 0.4);
+    border-color: rgba(148, 163, 184, 0.28);
 }
 
 .btn-secondary:hover:not(:disabled) {
-    background-color: var(--border-color);
-}
-
-.btn-success {
-    background-color: var(--success);
-    color: white;
-}
-
-.btn-success:hover:not(:disabled) {
-    background-color: var(--primary-dark);
-    box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+    background: rgba(71, 85, 105, 0.55);
+    border-color: rgba(148, 163, 184, 0.45);
 }
 
 .btn-danger {
-    background-color: var(--danger-color);
-    color: white;
+    color: #ffecec;
+    background: linear-gradient(135deg, rgba(239, 68, 68, 0.32), rgba(220, 38, 38, 0.22));
+    border-color: rgba(239, 68, 68, 0.45);
 }
 
 .btn-danger:hover:not(:disabled) {
-    background-color: #dc2626;
-    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
+    background: linear-gradient(135deg, rgba(239, 68, 68, 0.48), rgba(220, 38, 38, 0.34));
+    border-color: rgba(248, 113, 113, 0.7);
+    box-shadow: 0 6px 20px rgba(239, 68, 68, 0.26), 0 1px 0 var(--glass-highlight) inset;
 }
 
-/* Simulation Toggle */
-.simulation-toggle {
-    padding: 0.5rem 0;
-}
-
-.checkbox-container {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    cursor: pointer;
-    user-select: none;
-}
-
-.checkbox-container input {
-    width: 18px;
-    height: 18px;
-    cursor: pointer;
-}
-
-.checkbox-label {
-    font-size: 0.875rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-secondary);
-}
-
-/* Stats Row */
+/* Stats Row - fluid: as many columns as fit at >=130px each. 4 on desktop,
+   2 on a phone, 1 on a very narrow phone. No per-breakpoint overrides needed. */
 .stats-row {
+    order: 7;
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 1rem;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 0.75rem;
 }
 
 .stat-item {
     display: flex;
     flex-direction: column;
     align-items: center;
-    padding: 0.75rem;
-    background-color: var(--surface-dark);
-    border: 1px solid var(--border-color);
-    border-radius: 0.375rem;
+    padding: 0.75rem 0.5rem;
+    background: var(--glass-bg);
+    backdrop-filter: blur(var(--blur)) saturate(130%);
+    -webkit-backdrop-filter: blur(var(--blur)) saturate(130%);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--glass-shadow);
+    text-align: center;
 }
 
 .stat-label {
-    font-size: 0.75rem;
+    font-size: clamp(0.65rem, 2.4vw, 0.75rem);
     color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.4px;
     margin-bottom: 0.25rem;
 }
 
 .stat-value {
-    font-size: 1.25rem;
+    font-size: clamp(1rem, 4.5vw, 1.25rem);
     font-weight: 700;
     color: var(--primary-color);
     font-family: 'Courier New', monospace;
+    word-break: break-word;
 }
 
-/* Sidebar */
-.sidebar {
-    width: 350px;
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-    overflow-y: auto;
-}
-
+/* Sidebar panels. In the mobile column each panel is full width and ordered
+   individually so the hierarchy is: detection status -> system status ->
+   detections -> model info. On desktop they re-nest into the right column
+   (see the >=1025px block). */
 .panel {
-    background-color: var(--surface-dark);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
+    background: var(--glass-bg);
+    backdrop-filter: blur(var(--blur)) saturate(135%);
+    -webkit-backdrop-filter: blur(var(--blur)) saturate(135%);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
     padding: 1rem;
+    box-shadow: var(--glass-shadow);
+    transition: border-color 0.25s ease, box-shadow 0.25s ease;
 }
+
+.panel:hover {
+    border-color: rgba(148, 197, 175, 0.28);
+}
+
+/* Mobile column order. Plant-health info (the DETECTIONS panel holds the
+   per-plant Model 2 analysis cards) is pulled up to sit right after the
+   detection result, ahead of system status - matching the "see the plant, see
+   if it was detected, see its health, without scrolling" priority. Desktop
+   resets these to 0 and uses DOM order in the sidebar. */
+.panel--detection { order: 3; }
+.panel--list      { order: 4; }
+.panel--system    { order: 5; }
+.info-panel       { order: 6; }
 
 .panel-header {
-    margin-bottom: 1rem;
-    padding-bottom: 0.75rem;
-    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    align-items: center;
+    margin-bottom: 0.85rem;
+    padding-bottom: 0.65rem;
+    border-bottom: 1px solid var(--glass-border);
 }
 
 .panel-title {
-    font-size: 0.875rem;
+    font-size: 0.8rem;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-primary);
+    letter-spacing: 0.9px;
+    color: var(--text-secondary);
     margin: 0;
 }
 
@@ -396,42 +829,54 @@ body {
 }
 
 .status-badge {
-    padding: 0.25rem 0.625rem;
-    border-radius: 0.25rem;
-    font-size: 0.75rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.25rem 0.6rem 0.25rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.4px;
-    background-color: var(--offline);
-    color: var(--text-primary);
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+    background: rgba(100, 116, 139, 0.16);
+    border: 1px solid rgba(148, 163, 184, 0.25);
 }
 
-.status-badge.online {
-    background-color: var(--success);
+/* Dot marker so status is not communicated by colour alone. */
+.status-badge::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
 }
 
-.status-badge.ready {
-    background-color: var(--success);
+.status-badge.online,
+.status-badge.ready,
+.status-badge.active {
+    color: #6ee7b7;
+    background: rgba(16, 185, 129, 0.15);
+    border-color: rgba(16, 185, 129, 0.4);
 }
 
 .status-badge.loading {
-    background-color: var(--warning-color);
+    color: #fcd34d;
+    background: rgba(245, 158, 11, 0.15);
+    border-color: rgba(245, 158, 11, 0.4);
 }
 
 .status-badge.error {
-    background-color: var(--danger-color);
-}
-
-.status-badge.active {
-    background-color: var(--success);
+    color: #fca5a5;
+    background: rgba(239, 68, 68, 0.15);
+    border-color: rgba(239, 68, 68, 0.4);
 }
 
 .status-badge.paused {
-    background-color: var(--surface-light);
-}
-
-.status-badge.simulation {
-    background-color: var(--warning-color);
+    color: var(--text-muted);
+    background: rgba(51, 65, 85, 0.35);
+    border-color: rgba(148, 163, 184, 0.22);
 }
 
 /* Detection Summary */
@@ -445,17 +890,21 @@ body {
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    padding: 0.75rem;
-    border-radius: 0.375rem;
-    background-color: var(--surface-light);
+    padding: 0.85rem 0.9rem;
+    border-radius: var(--radius-sm);
+    background: rgba(100, 116, 139, 0.16);
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    transition: background 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
 }
 
 .summary-indicator.offline {
-    background-color: rgba(100, 116, 139, 0.3);
+    background: rgba(100, 116, 139, 0.16);
 }
 
 .summary-indicator.detected {
-    background-color: rgba(16, 185, 129, 0.2);
+    background: rgba(16, 185, 129, 0.16);
+    border-color: rgba(16, 185, 129, 0.4);
+    box-shadow: var(--accent-glow);
 }
 
 .indicator-dot {
@@ -473,28 +922,44 @@ body {
 
 .indicator-text {
     font-weight: 600;
-    font-size: 0.875rem;
+    font-size: clamp(0.8rem, 3vw, 0.9rem);
     text-transform: uppercase;
     letter-spacing: 0.4px;
+    line-height: 1.3;
 }
 
 .summary-stat {
     display: flex;
     justify-content: space-between;
-    align-items: center;
-    padding: 0.5rem 0;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding: 0.4rem 0;
+    border-bottom: 1px solid rgba(71, 85, 105, 0.35);
+}
+
+.summary-stat:last-child {
+    border-bottom: none;
 }
 
 .summary-label {
     color: var(--text-secondary);
-    font-size: 0.875rem;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
 }
 
 .summary-value {
     font-weight: 700;
-    font-size: 1.25rem;
+    font-size: 1.15rem;
     color: var(--primary-color);
     font-family: 'Courier New', monospace;
+    white-space: nowrap;
+}
+
+/* "Plants Detected" is the headline number - make it read as such. */
+.detection-summary .summary-stat:first-of-type .summary-value {
+    font-size: clamp(1.5rem, 7vw, 1.9rem);
+    line-height: 1;
 }
 
 /* Detections List */
@@ -502,18 +967,20 @@ body {
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
-    max-height: 200px;
+    max-height: min(45vh, 340px);
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
 }
 
 .detection-item {
     display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 0.625rem;
-    background-color: var(--surface-light);
+    flex-direction: column;
+    gap: 0.15rem;
+    padding: 0.7rem 0.8rem;
+    background: rgba(51, 65, 85, 0.32);
+    border: 1px solid var(--glass-border);
     border-left: 3px solid var(--primary-color);
-    border-radius: 0.25rem;
+    border-radius: var(--radius-sm);
     font-size: 0.875rem;
 }
 
@@ -536,9 +1003,10 @@ body {
     font-size: 0.875rem;
 }
 
-/* Info Panel */
+/* Info Panel (margin-top:auto only makes sense inside the desktop sidebar
+   column, where it pins this panel to the bottom - see the >=1025px block). */
 .info-panel {
-    margin-top: auto;
+    margin-top: 0;
 }
 
 .info-text {
@@ -575,73 +1043,224 @@ body {
     background-color: var(--primary-color);
 }
 
-/* Responsive Design */
-@media (max-width: 1400px) {
-    .sidebar {
-        width: 320px;
-    }
+/* ==========================================================================
+   RESPONSIVE LAYERS
+   Base styles above are MOBILE (single scrollable column). These add-ons:
+     >= 480px  small-phone -> larger-phone polish
+     >= 768px  tablet  - controls back to one row, roomier
+     >= 1025px desktop - two-column dashboard, viewport-height, internal scroll
+   ========================================================================== */
 
-    .stats-row {
-        grid-template-columns: repeat(2, 1fr);
-    }
+/* ---- Very small phones (<= 400px) --------------------------------------- */
+@media (max-width: 400px) {
+    .subtitle { display: none; }       /* logo alone is enough branding here */
 }
 
-@media (max-width: 1200px) {
-    .container {
-        flex-direction: column;
-    }
-
-    .main-panel {
-        min-height: 400px;
-    }
-
-    .sidebar {
-        width: 100%;
-        max-height: 300px;
-        flex-direction: row;
-        overflow-x: auto;
-        overflow-y: hidden;
-    }
-
-    .panel {
-        flex: 0 0 300px;
-    }
-
-    .stats-row {
-        grid-template-columns: repeat(2, 1fr);
-    }
-}
-
-@media (max-width: 768px) {
-    .header {
-        flex-direction: column;
-        gap: 1rem;
-        padding: 1rem;
-    }
-
-    .header-center {
-        order: 3;
-        width: 100%;
-    }
-
-    .container {
-        padding: 1rem;
-        gap: 1rem;
-    }
-
+@media (max-width: 360px) {
     .camera-controls {
+        grid-template-columns: 1fr;    /* one button per row rather than cramming two */
+    }
+    .btn .btn-icon { display: none; }  /* reclaim width for the label */
+    .container { gap: 0.6rem; }
+}
+
+/* ---- <= 767px : COMPACT MOBILE ----------------------------------------------
+   Tighten every gap / pad so HEADER + compact CAMERA + CONTROLS + DETECTION
+   RESULT + PLANT HEALTH land in (or very near) the first viewport. Text sizes
+   are kept readable - only whitespace is removed. Glassmorphism unchanged. */
+@media (max-width: 767px) {
+    .container {
+        gap: 0.65rem;
+        padding: 0.65rem;
+        padding-bottom: max(0.65rem, env(safe-area-inset-bottom));
+    }
+
+    .header {
+        padding: 0.45rem 0.85rem;
+        padding-top: max(0.45rem, env(safe-area-inset-top));
+    }
+
+    .camera-controls { gap: 0.5rem; }
+
+    .btn {
+        min-height: 44px;              /* still a comfortable touch target */
+        padding: 0.55rem 0.6rem;
+    }
+
+    .panel { padding: 0.8rem; }
+
+    .panel-header {
+        margin-bottom: 0.55rem;
+        padding-bottom: 0.5rem;
+    }
+
+    .panel-title { font-size: 0.72rem; letter-spacing: 0.7px; }
+
+    .detection-summary { gap: 0.55rem; }
+
+    .summary-indicator { padding: 0.6rem 0.7rem; }
+
+    .summary-stat { padding: 0.3rem 0; }
+
+    /* Headline plant count - prominent but not oversized on a small screen. */
+    .detection-summary .summary-stat:first-of-type .summary-value {
+        font-size: clamp(1.35rem, 6vw, 1.65rem);
+    }
+
+    .stats-row { gap: 0.5rem; }
+    .stat-item { padding: 0.55rem 0.4rem; }
+
+    /* Keep the plant-health list from growing tall - it can scroll internally. */
+    .detections-list { max-height: min(38vh, 260px); }
+
+    .info-text { margin-bottom: 0.35rem; }
+
+    /* Debug overlay: present but unobtrusive over the now-shorter camera. */
+    .debug-overlay {
+        top: 0.35rem;
+        left: 0.35rem;
+        padding: 0.28rem 0.42rem;
+        font-size: 0.5rem;
+        line-height: 1.25;
+        gap: 0;
+        max-width: 54%;
+    }
+    .debug-row { gap: 0.5rem; }
+}
+
+/* ---- >= 768px : tablet ---------------------------------------------------- */
+@media (min-width: 768px) {
+    .container {
+        gap: 1.25rem;
+        padding: 1.5rem;
+    }
+
+    /* Controls fit comfortably on one row again. */
+    .camera-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+    }
+    .btn {
+        flex: 1 1 200px;
+        padding: 0.75rem 1rem;
+    }
+    .btn .btn-icon { display: inline; }
+
+    /* Tablet has the room for a normal-size preview again. */
+    .camera-wrapper {
+        height: auto;
+        aspect-ratio: 16 / 9;
+        max-height: 68vh;
+    }
+}
+
+/* ---- >= 1025px : desktop dashboard ------------------------------------- */
+@media (min-width: 1025px) {
+    body {
+        /* Fill the viewport exactly - the dashboard is not meant to scroll -
+           but `overflow` is left alone so an unusually long detections list
+           can still scroll the page rather than being clipped. */
+        height: 100vh;
+    }
+
+    .container {
+        flex: 1 1 auto;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) clamp(300px, 24vw, 360px);
+        grid-template-rows: 100%;
+        gap: 1.5rem;
+        min-height: 0;
+    }
+
+    /* Re-form the two structural columns that were display:contents on mobile. */
+    .main-panel {
+        display: flex;
         flex-direction: column;
+        gap: 1rem;
+        min-width: 0;
+        min-height: 0;
+        overflow-y: auto;
+    }
+
+    .sidebar {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+        min-height: 0;
+        overflow-y: auto;
+        padding-right: 4px;
+    }
+
+    /* Order is irrelevant once each column owns its own children again, but
+       resetting keeps DOM order = visual order on desktop:
+       camera -> controls -> stats  |  system -> detection -> list -> info */
+    .camera-wrapper,
+    .camera-controls,
+    .stats-row,
+    .panel--system,
+    .panel--detection,
+    .panel--list,
+    .info-panel {
+        order: 0;
+    }
+
+    .camera-wrapper {
+        flex: 1 1 auto;
+        height: auto;                 /* fill the tall left column */
+        aspect-ratio: auto;
+        max-height: none;
+        min-height: 320px;
+    }
+
+    .info-panel {
+        margin-top: auto;             /* pin the Stage-1 card to the bottom */
     }
 
     .btn {
-        width: 100%;
+        flex: 1 1 0;
+        min-width: 160px;
     }
+}
 
-    .stats-row {
-        grid-template-columns: repeat(2, 1fr);
+/* ---- >= 1440px : a touch more generous -------------------------------- */
+@media (min-width: 1440px) {
+    .container {
+        grid-template-columns: minmax(0, 1fr) 380px;
+        gap: 2rem;
+        padding: 2rem;
     }
+}
 
-    .sidebar {
-        max-height: 250px;
+/* ==========================================================================
+   GLASS FALLBACK
+   Where backdrop-filter is unsupported (older browsers, some Firefox configs),
+   translucent panels would leave text on a busy background. Bump every glass
+   surface to near-opaque so readability is never a casualty of the effect.
+   ========================================================================== */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .header       { background: #10161d; }
+    .panel,
+    .stat-item,
+    .btn          { background: #141d27; }
+    .btn-primary,
+    .btn-success  { background: #12352b; }
+    .btn-danger   { background: #3a1c1c; }
+    .btn-secondary{ background: #2a3546; }
+    .debug-overlay { background: rgba(6, 12, 20, 0.94); }
+    .no-plant-popup { background: #1c160b; }
+}
+
+/* Hover affordances only where a real pointer exists - avoids sticky :hover
+   states on touch. */
+@media (hover: hover) and (pointer: fine) {
+    .btn:hover:not(:disabled) {
+        transform: translateY(-1px);
+    }
+    .stat-item {
+        transition: border-color 0.2s ease, transform 0.2s ease;
+    }
+    .stat-item:hover {
+        border-color: rgba(148, 197, 175, 0.28);
     }
 }

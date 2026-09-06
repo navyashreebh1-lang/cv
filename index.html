@@ -2,11 +2,22 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#020617">
+    <meta name="color-scheme" content="dark">
     <title>AGRIVISION - Plant Detection System</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
+    <!-- Decorative depth layer: soft blurred orbs behind the glass UI. Fixed,
+         non-interactive, very low opacity - never affects readability or the
+         camera. Purely CSS; no JS. -->
+    <div class="bg-orbs" aria-hidden="true">
+        <span class="orb orb--1"></span>
+        <span class="orb orb--2"></span>
+        <span class="orb orb--3"></span>
+    </div>
+
     <!-- Header -->
     <header class="header">
         <div class="header-left">
@@ -17,7 +28,7 @@
             <div class="mode-badge" id="modeBadge">LIVE MODE</div>
         </div>
         <div class="header-right">
-            <div class="status-indicator" id="statusIndicator">
+            <div class="status-indicator" id="statusIndicator" role="status" aria-live="polite">
                 <span class="status-dot"></span>
                 <span class="status-text">INITIALIZING</span>
             </div>
@@ -25,7 +36,7 @@
     </header>
 
     <!-- Main Content -->
-    <div class="container">
+    <main class="container">
         <!-- Camera Panel -->
         <div class="main-panel">
             <div class="camera-wrapper">
@@ -36,6 +47,30 @@
                         <div class="spinner"></div>
                         <p>Initializing Camera...</p>
                     </div>
+                </div>
+
+                <!-- Blue live diagnostics, drawn over the camera feed in the
+                     top-left. DOM element rather than canvas text so it stays
+                     crisp regardless of the video's native resolution and never
+                     paints over the bounding boxes. Updated every inference
+                     frame by UIManager.updateDebugOverlay(). -->
+                <div id="debugOverlay" class="debug-overlay" aria-hidden="true">
+                    <div class="debug-row"><span class="debug-label">ENGINE</span><span class="debug-value" id="dbgEngine">--</span></div>
+                    <div class="debug-row"><span class="debug-label">RAW DETECTIONS</span><span class="debug-value" id="dbgRaw">0</span></div>
+                    <div class="debug-row"><span class="debug-label">PLANT CANDIDATES</span><span class="debug-value" id="dbgValid">0</span></div>
+                    <div class="debug-row"><span class="debug-label">CONFIRMED PLANTS</span><span class="debug-value" id="dbgFinal">0</span></div>
+                    <div class="debug-row"><span class="debug-label">HIGHEST CONFIDENCE</span><span class="debug-value" id="dbgConf">--</span></div>
+                    <div class="debug-row"><span class="debug-label">INFERENCE TIME</span><span class="debug-value" id="dbgTime">0 ms</span></div>
+                    <div class="debug-row debug-status"><span class="debug-label">STATUS</span><span class="debug-value" id="dbgStatus">IDLE</span></div>
+                </div>
+
+                <!-- Live feedback popup, shown over the video whenever the
+                     detector reports ZERO valid plants in the current frame
+                     (see UIManager.updateNoPlantPopup). Hidden by default. -->
+                <div id="noPlantPopup" class="no-plant-popup" hidden role="alert">
+                    <div class="no-plant-icon" aria-hidden="true">⚠️</div>
+                    <div class="no-plant-title">NO PLANT DETECTED</div>
+                    <div class="no-plant-message">Please show a plant to the camera.</div>
                 </div>
             </div>
 
@@ -53,14 +88,6 @@
                 <button id="stopDetectionBtn" class="btn btn-danger" disabled>
                     <span class="btn-icon">◼</span> STOP DETECTION
                 </button>
-            </div>
-
-            <!-- Simulation Mode Toggle -->
-            <div class="simulation-toggle">
-                <label class="checkbox-container">
-                    <input type="checkbox" id="simulationModeToggle">
-                    <span class="checkbox-label">SIMULATION MODE</span>
-                </label>
             </div>
 
             <!-- Stats Row -->
@@ -87,7 +114,7 @@
         <!-- Right Sidebar -->
         <div class="sidebar">
             <!-- System Status -->
-            <div class="panel">
+            <div class="panel panel--system">
                 <div class="panel-header">
                     <h3 class="panel-title">⚙️ SYSTEM STATUS</h3>
                 </div>
@@ -112,11 +139,11 @@
             </div>
 
             <!-- Detection Status -->
-            <div class="panel">
+            <div class="panel panel--detection">
                 <div class="panel-header">
                     <h3 class="panel-title">🔍 DETECTION STATUS</h3>
                 </div>
-                <div class="detection-summary" id="detectionSummary">
+                <div class="detection-summary" id="detectionSummary" role="status" aria-live="polite">
                     <div class="summary-indicator offline">
                         <span class="indicator-dot"></span>
                         <span class="indicator-text">NO DETECTION</span>
@@ -137,7 +164,7 @@
             </div>
 
             <!-- Detections List -->
-            <div class="panel">
+            <div class="panel panel--list">
                 <div class="panel-header">
                     <h3 class="panel-title">📋 DETECTIONS</h3>
                 </div>
@@ -162,7 +189,7 @@
                 </p>
             </div>
         </div>
-    </div>
+    </main>
 
     <!-- TensorFlow.js + COCO-SSD (fallback) and tfjs-tflite (custom plant detector).
          Versions are pinned deliberately, not just for reproducibility:
