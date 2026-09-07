@@ -1,0 +1,34 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>shot</title>
+<style>html,body{margin:0;background:#0b1219}iframe{border:0;display:block}</style></head><body>
+<div id="stage"></div>
+<!-- Holds the load event open so --screenshot fires after the app is
+     running. Lets the shot be taken WITHOUT --virtual-time-budget,
+     under which rAF stalls and the camera never starts. -->
+<img src="/slow?ms=11000" alt="" width="1" height="1" style="opacity:0">
+<script>
+// Renders the real app at an exact viewport size and drives it to a chosen
+// scenario, so the page can simply be screenshotted. Uses setTimeout only -
+// rAF can stall under --virtual-time-budget.
+const q = new URLSearchParams(location.search);
+const W = +(q.get('w') || 390), H = +(q.get('h') || 844), S = q.get('s') || 'onePlant';
+const f = document.createElement('iframe');
+f.width = W; f.height = H; f.src = '/_probe/ui_app.html';
+document.getElementById('stage').appendChild(f);
+f.onload = () => {
+  const win = f.contentWindow, doc = f.contentDocument;
+  const waitReady = () => {
+    if (win.AGRIVISION && win.AGRIVISION.ui.state.modelReady) return start();
+    setTimeout(waitReady, 150);
+  };
+  const start = () => {
+    win.__scenario = S;
+    win.__health = q.get('health') || 'healthy';
+    doc.getElementById('startCameraBtn').click();
+    setTimeout(() => {
+      doc.getElementById('startDetectionBtn').click();
+      setTimeout(() => { document.title = 'READY'; }, 3000);
+    }, 2500);
+  };
+  waitReady();
+};
+</script></body></html>

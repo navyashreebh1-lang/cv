@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#020617">
     <meta name="color-scheme" content="dark">
     <title>AGRIVISION - Plant Detection System</title>
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="/style.css">
 </head>
 <body>
     <!-- Decorative depth layer: soft blurred orbs behind the glass UI. Fixed,
@@ -142,7 +142,69 @@
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/dist/tf-tflite.min.js"></script>
 
+
+    <!-- UI PROBE STUBS. Replace ONLY the two model libraries. Real tfjs is kept
+         (cropToTensor genuinely uses it) and /script.js is loaded unmodified, so
+         the detection pipeline, the tracker and every UI code path under test
+         are the production ones. -->
+    <script>
+    (function () {
+      // Each scenario is a list of RAW boxes as COCO-SSD would emit them,
+      // including the non-plant classes the pipeline is supposed to reject.
+      window.__scenarios = {
+        empty:        [],
+        personOnly:   [{ class: 'person', score: 0.95, bbox: [40, 30, 150, 380] }],
+        objectsOnly:  [{ class: 'person', score: 0.93, bbox: [20, 20, 120, 300] },
+                       { class: 'chair',  score: 0.71, bbox: [330, 180, 140, 190] },
+                       { class: 'laptop', score: 0.64, bbox: [180, 300, 120, 90] }],
+        onePlant:     [{ class: 'potted plant', score: 0.92, bbox: [200, 110, 170, 230] }],
+        personPlant:  [{ class: 'person',       score: 0.96, bbox: [20, 20, 130, 380] },
+                       { class: 'potted plant', score: 0.89, bbox: [220, 120, 160, 220] }],
+        twoPlants:    [{ class: 'potted plant', score: 0.91, bbox: [60, 110, 150, 210] },
+                       { class: 'potted plant', score: 0.87, bbox: [330, 130, 150, 210] }],
+        threePlants:  [{ class: 'potted plant', score: 0.93, bbox: [30, 110, 130, 200] },
+                       { class: 'potted plant', score: 0.88, bbox: [230, 120, 130, 200] },
+                       { class: 'potted plant', score: 0.85, bbox: [430, 115, 130, 200] }],
+        plantAndVase: [{ class: 'potted plant', score: 0.90, bbox: [200, 110, 170, 230] },
+                       { class: 'vase',         score: 0.66, bbox: [235, 250, 100, 95] }]
+      };
+      window.__scenario = 'empty';
+      window.__detects = 0;
+
+      window.cocoSsd = {
+        load: async () => ({
+          detect: async () => {
+            window.__detects++;
+            const boxes = window.__scenarios[window.__scenario] || [];
+            // deep copy - the pipeline is free to mutate what it is handed
+            return boxes.map(b => ({ class: b.class, score: b.score, bbox: b.bbox.slice() }));
+          }
+        })
+      };
+
+      // Model 2: probabilities over the 4 classes in _probe/model/class_names.json
+      // (Tomato healthy / Tomato Early blight / Potato healthy / Potato Late blight).
+      // __health picks which verdict the classifier "returns".
+      window.__healthProbs = {
+        healthy:   [0.94, 0.03, 0.02, 0.01],
+        unhealthy: [0.06, 0.87, 0.04, 0.03],
+        uncertain: [0.30, 0.28, 0.22, 0.20]
+      };
+      window.__health = 'healthy';
+      window.__model2Calls = 0;
+
+      window.tflite = {
+        setWasmPath() {},
+        loadTFLiteModel: async () => ({
+          predict: () => {
+            window.__model2Calls++;
+            return window.tf.tensor2d([window.__healthProbs[window.__health]]);
+          }
+        })
+      };
+    })();
+    </script>
     <!-- Application Script -->
-    <script src="script.js"></script>
+    <script src="/script.js"></script>
 </body>
 </html>

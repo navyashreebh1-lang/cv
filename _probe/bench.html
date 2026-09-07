@@ -1,0 +1,103 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>bench</title></head><body>
+<pre id="log">starting…</pre><div id="stage"></div>
+<script>
+// Reads ONLY observable state - DOM text and window.tf - because script.js
+// declares its modules with top-level `const`, which is script scope, not
+// window. Same harness runs against before and after, so the comparison is fair.
+const RUN_MS = 20000, LABEL = new URLSearchParams(location.search).get('label') || 'run';
+const log = m => { document.getElementById('log').textContent += '\n' + m; };
+const num = s => { const v = parseFloat(String(s).replace(/[^\d.]/g, '')); return isFinite(v) ? v : null; };
+
+(async () => {
+  const f = document.createElement('iframe');
+  f.width = 640; f.height = 520; f.src = "/_probe/bench_app.html" + location.search;
+  document.getElementById('stage').appendChild(f);
+  await new Promise(r => f.onload = r);
+  const W = f.contentWindow, D = f.contentDocument;
+  const txt = id => (D.getElementById(id) || {}).textContent || '';
+
+  let consoleCalls = 0;
+  const origLog = W.console.log;
+  W.console.log = function (...a) { consoleCalls++; return origLog.apply(this, a); };
+
+  // Model readiness is read from the app's own state, not from a status badge:
+  // the SYSTEM STATUS panel (and its #aiStatus element) was removed from the UI.
+  const ready = () => !!(W.AGRIVISION && W.AGRIVISION.ui.state.modelReady);
+  const t0 = performance.now();
+  while (!ready() && performance.now() - t0 < 240000) {
+    await new Promise(r => setTimeout(r, 250));
+  }
+  const modelLoadMs = performance.now() - t0;
+  log('modelReady after ' + modelLoadMs.toFixed(0) + 'ms');
+  if (!ready()) throw new Error('model never became READY');
+
+  D.getElementById('startCameraBtn').click();
+  await new Promise(r => setTimeout(r, 3000));
+  D.getElementById('startDetectionBtn').click();
+  await new Promise(r => setTimeout(r, 2000));
+
+  // Optional harness-only pin of the adaptive inference rate, so a run can be
+  // compared against the baseline at an IDENTICAL detect() frequency. Reads the
+  // AGRIVISION diagnostics global; absent on the pre-change baseline, hence the
+  // guard. Changes no detection setting - only how often the cycle runs.
+  const PIN = num(new URLSearchParams(location.search).get('minint'));
+  if (PIN && W.AGRIVISION && W.AGRIVISION.monitor) {
+    const m = W.AGRIVISION.monitor;
+    m.minIntervalMs = PIN; m.maxIntervalMs = Math.max(PIN, m.maxIntervalMs);
+    m.detectionIntervalMs = PIN;
+    log('pinned minIntervalMs=' + PIN);
+  }
+  log('cameraStatus=' + txt('cameraStatus') + ' detectionStatus=' + txt('detectionStatus'));
+
+  const deltas = [], mem = [], camFps = [], infFps = [], infMs = [];
+  let longTasks = 0, longTaskMs = 0;
+  try {
+    new W.PerformanceObserver(list => {
+      for (const e of list.getEntries()) { longTasks++; longTaskMs += e.duration; }
+    }).observe({ entryTypes: ['longtask'] });
+  } catch (e) { log('no longtask observer'); }
+
+  consoleCalls = 0;
+  const start = performance.now();
+  let prev = performance.now(), rafs = 0;
+  const tick = () => { const n = performance.now(); deltas.push(n - prev); prev = n; rafs++;
+                       if (n - start < RUN_MS) W.requestAnimationFrame(tick); };
+  W.requestAnimationFrame(tick);
+
+  const timer = setInterval(() => {
+    try { const m = W.tf.memory(); mem.push([Math.round(performance.now() - start), m.numTensors, m.numBytes]); } catch (e) {}
+    const c = num(txt('cameraFpsValue')), i = num(txt('inferenceFpsValue')), t = num(txt('inferenceTimeValue'));
+    if (c !== null) camFps.push(c);
+    if (i !== null) infFps.push(i);
+    if (t !== null && t > 0) infMs.push(t);
+  }, 500);
+
+  await new Promise(r => setTimeout(r, RUN_MS + 400));
+  clearInterval(timer);
+  const elapsed = (performance.now() - start) / 1000;
+  const avg = a => a.length ? +(a.reduce((x, y) => x + y, 0) / a.length).toFixed(1) : null;
+  const sorted = deltas.slice().sort((a, b) => a - b);
+  const pct = p => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))] || 0;
+  const jank = deltas.filter(d => d > 33.4).length, bad = deltas.filter(d => d > 100).length;
+
+  const res = {
+    label: LABEL, tfBackend: (()=>{try{return W.tf.getBackend()}catch(e){return 'n/a'}})(), modelLoadMs: Math.round(modelLoadMs), seconds: +elapsed.toFixed(1),
+    uiFps: +(rafs / elapsed).toFixed(1),
+    frameDeltaMs: { p50: +pct(.5).toFixed(1), p90: +pct(.9).toFixed(1), p99: +pct(.99).toFixed(1), max: +Math.max(...deltas).toFixed(1) },
+    jankFrames_gt33ms: jank, jankPct: +(100 * jank / deltas.length).toFixed(1), freezeFrames_gt100ms: bad,
+    longTasks, longTaskMsTotal: Math.round(longTaskMs), longTaskMsPerSec: +(longTaskMs / elapsed).toFixed(0),
+    consoleCallsPerSec: +(consoleCalls / elapsed).toFixed(1),
+    reportedCameraFps: avg(camFps), reportedInferenceFps: avg(infFps), avgInferenceMs: avg(infMs),
+    tensors: mem.length ? { first: mem[0][1], last: mem[mem.length - 1][1],
+                            growth: mem[mem.length - 1][1] - mem[0][1],
+                            maxMB: +(Math.max(...mem.map(m => m[2])) / 1048576).toFixed(1) } : null,
+    tensorSeries: mem,
+    stubDetectCalls: (W.__bench||{}).detects, stubModel2Calls: (W.__bench||{}).model2,
+    detectCallsPerSec: +(((W.__bench||{}).detects||0)/elapsed).toFixed(2)
+  };
+  log(JSON.stringify(res, null, 1));
+  await fetch('/result', { method: 'POST', body: JSON.stringify(res) });
+  log('POSTED');
+})().catch(e => { log('ERROR ' + e.message);
+  fetch('/result', { method: 'POST', body: JSON.stringify({ error: e.message, stack: String(e.stack) }) }); });
+</script></body></html>

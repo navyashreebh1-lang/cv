@@ -51,7 +51,27 @@ FUTURE EXTENSIBILITY:
 // Every step of model load / inference logs through here with a consistent
 // prefix so it's easy to filter in devtools (Console -> filter "[AGRIVISION]")
 // while diagnosing why detection isn't producing results.
+//
+// PER-FRAME verbose diagnostics are OFF by default. The detection path used to
+// emit ~20 console.log calls per inference frame - measured at 70 calls/second -
+// and each one built template-literal strings with .map/.filter/.join over every
+// raw detection. That string building happens whether or not DevTools is open,
+// and it was the single largest source of main-thread stutter. Model load,
+// errors and the periodic performance summary still log unconditionally.
+//
+// Turn the per-frame detail back on at any time from the console:
+//     AGRIVISION.setVerbose(true)
+// Nothing about detection behaviour changes with the flag - it only controls
+// what is printed.
+let VERBOSE_LOGGING = false;
+
 function debugLog(...args) {
+    if (!VERBOSE_LOGGING) return;
+    console.log('[AGRIVISION]', ...args);
+}
+
+// Always printed: lifecycle, errors, and the throttled performance summary.
+function infoLog(...args) {
     console.log('[AGRIVISION]', ...args);
 }
 
@@ -163,8 +183,8 @@ const DETECTION_CONFIG = {
     // window only matters for weak/borderline detections, which is exactly
     // where a single frame is not trustworthy.
     //
-    // Frames here are DETECTION frames (~8/s, see minDetectionIntervalMs), so
-    // 1 frame is roughly 125 ms.
+    // Frames here are DETECTION frames (~8-12/s, see
+    // PerformanceMonitor.detectionIntervalMs), so 1 frame is roughly 85-125 ms.
     temporal: {
         enabled: true,
         windowFrames: 6,            // ~750ms of history per track
@@ -191,7 +211,20 @@ const DETECTION_CONFIG = {
         persistentHits: 5,
         // Below this, a confirmed plant is flagged UNCERTAIN in the UI rather
         // than presented as a solid result. Nothing is hidden - it still counts.
-        strongScore: 0.50
+        strongScore: 0.50,
+        // ---- box smoothing (display only) ---------------------------------
+        // COCO-SSD's box for a stationary plant jitters by a few pixels every
+        // frame, which reads as a shivering rectangle. This is a light EMA on
+        // the DRAWN box: weight on the newest observation, so the lag is well
+        // under one detection frame (~30-50ms) and the box still feels attached
+        // to the plant. It affects nothing but the rectangle's coordinates -
+        // association, confirmation, counting and class validation all continue
+        // to use the model's raw output.
+        boxSmoothing: 0.6,
+        // If the plant moves far enough that the new box barely overlaps the
+        // smoothed one, snap straight to the observation instead of easing
+        // toward it - smoothing must never turn into visible drag.
+        boxSnapIou: 0.50
     },
     // TensorFlow NMS: a raw model box overlapping an already-kept box by more
     // than this IoU is treated as the same box and dropped.
@@ -232,7 +265,19 @@ const DETECTION_CONFIG = {
     plantClassNames: ['plant', 'potted plant', 'houseplant', 'flowers'],
     // Draw the RAW / CONFIDENCE / NMS / FINAL counts onto the canvas. Temporary
     // visual debugging for this fix - set false to hide.
-    debugHud: true,
+
+    // ---- PERFORMANCE -------------------------------------------------------
+    // One throttled summary line every few seconds (camera FPS, inference FPS,
+    // inference time, average, tensor memory, skipped frames, Model 2 time).
+    // This is production-safe: it is O(1) per cycle and does not scale with the
+    // number of detections, unlike the per-frame verbose logging it replaced.
+    perfSummary: true,
+
+    // How often the on-screen numbers are refreshed. Inference runs at ~10/s but
+    // the stats row and the blue overlay do not need to be rewritten that often -
+    // a human cannot read them faster than this, and every write is layout work
+    // on the main thread that competes with the camera preview.
+    uiThrottleMs: 250,
 
     // ---- MODEL 2: plant health / crop analysis -----------------------------
     // Runs only on the crops Model 1 already validated as plants. Disabled
@@ -246,6 +291,13 @@ const DETECTION_CONFIG = {
         // change condition between frames, so run it on a slow cadence and
         // carry results forward by box overlap in between.
         intervalMs: 800,
+        // Force a re-classification of an unchanged plant this often, so a
+        // verdict can never go stale indefinitely.
+        refreshMs: 4000,
+        // If the plant's box still overlaps the region we last classified by
+        // more than this, the crop is effectively the same picture - skip it.
+        // Below it, the plant has moved or resized enough to be worth re-running.
+        regionChangeIou: 0.85,
         // Expand the detection box slightly before cropping - COCO-SSD boxes
         // sometimes clip leaf tips, and the classifier needs the lesion.
         cropMarginPct: 0.08,
@@ -373,6 +425,21 @@ function scoreThresholdFor(engine) {
 // It works on the REAL scores throughout. The EMA is used only to decide
 // whether to confirm; the confidence reported to the UI is the genuine
 // COCO-SSD score from the last frame the plant was actually seen.
+// Light exponential smoothing of a bounding box, for DISPLAY only. Snaps
+// instead of easing when the plant has clearly moved, so a fast-moving plant
+// never trails its box.
+function smoothBox(prev, obs, cfg) {
+    if (!prev) return { ...obs };
+    if (boxIoU(prev, obs) < cfg.boxSnapIou) return { ...obs };
+    const a = cfg.boxSmoothing;
+    return {
+        x: a * obs.x + (1 - a) * prev.x,
+        y: a * obs.y + (1 - a) * prev.y,
+        width: a * obs.width + (1 - a) * prev.width,
+        height: a * obs.height + (1 - a) * prev.height
+    };
+}
+
 const PlantTracker = {
     tracks: [],
     nextId: 1,
@@ -404,7 +471,8 @@ const PlantTracker = {
             if (best) {
                 matchedTracks.add(best.id);
                 claimed.add(cand);
-                best.boundingBox = cand.boundingBox;
+                best.boundingBox = cand.boundingBox;          // raw, used for association
+                best.smoothBox = smoothBox(best.smoothBox, cand.boundingBox, cfg);
                 best.className = cand.className;
                 best.confidence = cand.confidence;      // real, latest score
                 best.ema = cfg.emaAlpha * score + (1 - cfg.emaAlpha) * best.ema;
@@ -422,6 +490,7 @@ const PlantTracker = {
                 this.tracks.push({
                     id,
                     boundingBox: cand.boundingBox,
+                    smoothBox: { ...cand.boundingBox },   // starts exactly on the observation
                     className: cand.className,
                     confidence: cand.confidence,
                     ema: score,
@@ -465,7 +534,8 @@ const PlantTracker = {
             .map(t => ({
                 className: t.className,
                 confidence: t.confidence,               // genuine COCO-SSD score
-                boundingBox: t.boundingBox,
+                boundingBox: t.smoothBox || t.boundingBox,   // display-smoothed
+                rawBoundingBox: t.boundingBox,
                 trackId: t.id,
                 confirmed: true,
                 // Flagged, never hidden: a confirmed-but-weak plant is still
@@ -817,6 +887,17 @@ const PlantAnalyzer = {
     inputSize: 224,
     lastRunAt: 0,
     inferenceTime: 0,
+    runs: 0,
+    // ONE reusable offscreen canvas for cropping, allocated on first use.
+    // cropToTensor used to document.createElement('canvas') per detection per
+    // cycle - up to 4 canvas allocations + 4 2D contexts per analysis cycle,
+    // all immediately garbage. The canvas is a fixed inputSize square, so it
+    // never needs resizing between crops.
+    scratchCanvas: null,
+    scratchCtx: null,
+    // trackId -> { box, at, result }: what we last classified for that plant and
+    // when. Lets the classifier be skipped for a plant that has not moved.
+    lastByTrack: new Map(),
 
     async load() {
         if (!DETECTION_CONFIG.analysis.enabled) {
@@ -876,13 +957,20 @@ const PlantAnalyzer = {
         const sh = Math.min(srcH - sy, box.height + my * 2);
         if (sw < 8 || sh < 8) return null;
 
-        const canvas = document.createElement('canvas');
-        canvas.width = this.inputSize;
-        canvas.height = this.inputSize;
-        const ctx = canvas.getContext('2d');
+        if (!this.scratchCanvas || this.scratchCanvas.width !== this.inputSize) {
+            this.scratchCanvas = document.createElement('canvas');
+            this.scratchCanvas.width = this.inputSize;
+            this.scratchCanvas.height = this.inputSize;
+            this.scratchCtx = this.scratchCanvas.getContext('2d', { willReadFrequently: true });
+        }
+        const ctx = this.scratchCtx;
+        // Previous crop must not show through where this one does not cover.
+        ctx.clearRect(0, 0, this.inputSize, this.inputSize);
         ctx.drawImage(frame, sx, sy, sw, sh, 0, 0, this.inputSize, this.inputSize);
 
-        return tf.tidy(() => tf.browser.fromPixels(canvas).toFloat().expandDims(0));
+        // tidy() disposes the fromPixels/toFloat intermediates; the returned
+        // tensor escapes tidy by design and is disposed by analyzeOne's finally.
+        return tf.tidy(() => tf.browser.fromPixels(this.scratchCanvas).toFloat().expandDims(0));
     },
 
     // Turn one softmax vector over "Crop___Condition" classes into crop /
@@ -956,28 +1044,68 @@ const PlantAnalyzer = {
         }
     },
 
-    // Analyse every detection in this frame, independently. Returns after
-    // mutating each detection with `.analysis`.
+    // Does this plant actually need the classifier run again?
+    //
+    // Model 2 is far heavier than detection, and a plant's crop and condition do
+    // not change from frame to frame - so re-classifying an unmoved plant is
+    // pure wasted CPU. It is re-run only when the plant is new, when its region
+    // has genuinely changed (the box no longer overlaps what we classified), or
+    // when the refresh interval has elapsed so a stale verdict cannot persist
+    // indefinitely.
+    needsAnalysis(det, now, cfg) {
+        const prev = det.trackId != null ? this.lastByTrack.get(det.trackId) : null;
+        if (!prev) return true;                                   // never analysed
+        if (now - prev.at >= cfg.refreshMs) return true;          // periodic refresh
+        return boxIoU(prev.box, det.boundingBox) < cfg.regionChangeIou;  // moved
+    },
+
+    // Analyse the detections in this frame that need it, independently. Returns
+    // after mutating each detection with `.analysis`.
     async analyzeDetections(frame, detections) {
         if (!this.available || !detections.length) return;
-
+        const cfg = DETECTION_CONFIG.analysis;
         const now = performance.now();
-        if (now - this.lastRunAt < DETECTION_CONFIG.analysis.intervalMs) return;
+
+        // Free: reapply the cached verdict for every plant we have already
+        // classified, so its card stays populated between analysis cycles.
+        for (const det of detections) {
+            const prev = det.trackId != null ? this.lastByTrack.get(det.trackId) : null;
+            if (prev) det.analysis = prev.result;
+        }
+
+        const due = detections.filter(det => this.needsAnalysis(det, now, cfg));
+        if (!due.length) return;                       // nothing changed - no work at all
+
+        // Rate-limit the cycles that actually run the model.
+        if (now - this.lastRunAt < cfg.intervalMs) return;
         this.lastRunAt = now;
 
         const start = performance.now();
-        const limit = Math.min(detections.length, DETECTION_CONFIG.analysis.maxPerCycle);
+        const limit = Math.min(due.length, cfg.maxPerCycle);
         for (let i = 0; i < limit; i++) {
+            const det = due[i];
             try {
-                const result = await this.analyzeOne(frame, detections[i].boundingBox);
-                if (result) detections[i].analysis = result;
+                const result = await this.analyzeOne(frame, det.boundingBox);
+                if (result) {
+                    det.analysis = result;
+                    this.runs++;
+                    if (det.trackId != null) {
+                        this.lastByTrack.set(det.trackId, {
+                            box: { ...det.boundingBox },
+                            at: performance.now(),
+                            result
+                        });
+                    }
+                }
             } catch (err) {
+                // One bad crop must not abort the rest of the cycle.
                 console.error('[AGRIVISION] Model 2 analysis error:', err);
             }
         }
         this.inferenceTime = performance.now() - start;
+        this.pruneCache(detections);
 
-        detections.slice(0, limit).forEach((d, i) => {
+        if (VERBOSE_LOGGING) detections.slice(0, limit).forEach((d, i) => {
             const a = d.analysis;
             if (!a) return;
             debugLog(a.uncertain
@@ -987,6 +1115,30 @@ const PlantAnalyzer = {
                   `${a.health} ${(a.healthConfidence * 100).toFixed(0)}% | ` +
                   `${a.condition} ${(a.conditionConfidence * 100).toFixed(0)}%`);
         });
+    },
+
+    // Drop cache entries for tracks that no longer exist, so a long session
+    // cannot grow the map without bound.
+    pruneCache(detections) {
+        if (this.lastByTrack.size <= 8) return;
+        const live = new Set(detections.map(d => d.trackId));
+        for (const id of this.lastByTrack.keys()) {
+            if (!live.has(id)) this.lastByTrack.delete(id);
+        }
+    },
+
+    // Track ids restart from 1 after PlantTracker.reset(), so a stale cache
+    // could otherwise hand a new plant an old plant's verdict.
+    resetCache() {
+        this.lastByTrack.clear();
+        this.lastRunAt = 0;
+    },
+
+    // Camera stopped: give back the crop canvas and the cache.
+    releaseScratch() {
+        this.scratchCanvas = null;
+        this.scratchCtx = null;
+        this.resetCache();
     },
 
     // Between analysis cycles, keep showing the previous verdict for a plant
@@ -1150,14 +1302,17 @@ const DetectionEngine = {
             this.lastPipelineStats.final = confirmed.length;
         }
 
-        debugLog(`TEMPORAL CONFIRMATION: ${PlantTracker.describe()}`);
-        debugLog(`FINAL PLANT COUNT (confirmed): ${confirmed.length}`);
-        if (confirmed.length === 0 && candidates.length > 0) {
-            debugLog(`NO PLANT: ${candidates.length} candidate(s) present but not yet ` +
-                `temporally confirmed (need ${DETECTION_CONFIG.temporal.minHits} hits in ` +
-                `${DETECTION_CONFIG.temporal.windowFrames} frames at score ` +
-                `>= ${DETECTION_CONFIG.temporal.confirmScore}, or one frame ` +
-                `>= ${DETECTION_CONFIG.temporal.instantConfirmScore})`);
+        // Guarded: describe() walks and formats every live track, per frame.
+        if (VERBOSE_LOGGING) {
+            debugLog(`TEMPORAL CONFIRMATION: ${PlantTracker.describe()}`);
+            debugLog(`FINAL PLANT COUNT (confirmed): ${confirmed.length}`);
+            if (confirmed.length === 0 && candidates.length > 0) {
+                debugLog(`NO PLANT: ${candidates.length} candidate(s) present but not yet ` +
+                    `temporally confirmed (need ${DETECTION_CONFIG.temporal.minHits} hits in ` +
+                    `${DETECTION_CONFIG.temporal.windowFrames} frames at score ` +
+                    `>= ${DETECTION_CONFIG.temporal.confirmScore}, or one frame ` +
+                    `>= ${DETECTION_CONFIG.temporal.instantConfirmScore})`);
+            }
         }
         return confirmed;
     },
@@ -1173,7 +1328,9 @@ const DetectionEngine = {
             try {
                 const results = await CustomModel.detect(frame);
                 this.inferenceTime = performance.now() - startTime;
-                debugLog(`Inference: ${this.inferenceTime.toFixed(0)}ms, plant detections: ${results.length}`);
+                if (VERBOSE_LOGGING) {
+                    debugLog(`Inference: ${this.inferenceTime.toFixed(0)}ms, plant detections: ${results.length}`);
+                }
                 return results;
             } catch (err) {
                 console.error('[AGRIVISION] Detection error:', err);
@@ -1225,68 +1382,70 @@ const DetectionEngine = {
             });
 
             // ---- Diagnostics -------------------------------------------------
-            // PLANT CANDIDATES = every box whose CLASS could be a plant, at ANY
-            // score. Comparing this against RAW and against the final count is
-            // what distinguishes "the model never saw a plant" from "our filter
-            // threw the plant away" - the two have completely different fixes,
-            // so the log states which one happened instead of leaving it to
-            // guesswork.
-            const plantCandidates = mapped.filter(d => isPlantClass(d.className));
-            const personDets = mapped.filter(d => d.className.toLowerCase() === 'person');
-            const ignored = mapped.filter(d => !isPlantClass(d.className));
-            const weakPlants = plantCandidates.filter(
-                d => parseFloat(d.confidence) < minConfidence * 100);
+            // GUARDED. Everything below is string building over every raw
+            // detection (.map/.filter/.join/.toFixed) purely to produce console
+            // output. Unguarded it ran on every inference frame - the dominant
+            // main-thread cost in this function. `lastPipelineStats` (which the
+            // debug overlay reads) is assigned outside the guard, so the UI is
+            // unaffected. Enable with AGRIVISION.setVerbose(true).
+            if (VERBOSE_LOGGING) {
+                const plantCandidates = mapped.filter(d => isPlantClass(d.className));
+                const personDets = mapped.filter(d => d.className.toLowerCase() === 'person');
+                const ignored = mapped.filter(d => !isPlantClass(d.className));
+                const weakPlants = plantCandidates.filter(
+                    d => parseFloat(d.confidence) < minConfidence * 100);
 
-            const boxStr = d => `[x:${d.boundingBox.x.toFixed(0)} y:${d.boundingBox.y.toFixed(0)} ` +
-                `w:${d.boundingBox.width.toFixed(0)} h:${d.boundingBox.height.toFixed(0)}]`;
+                const boxStr = d => `[x:${d.boundingBox.x.toFixed(0)} y:${d.boundingBox.y.toFixed(0)} ` +
+                    `w:${d.boundingBox.width.toFixed(0)} h:${d.boundingBox.height.toFixed(0)}]`;
 
-            debugLog(`RAW: ${mapped.length} detection(s) at/above the ` +
-                `${(DETECTION_CONFIG.observationFloor * 100).toFixed(0)}% observation floor`);
-            mapped.forEach(d => debugLog(
-                `  class=${d.className} confidence=${(parseFloat(d.confidence) / 100).toFixed(3)} box=${boxStr(d)}`));
+                debugLog(`RAW: ${mapped.length} detection(s) at/above the ` +
+                    `${(DETECTION_CONFIG.observationFloor * 100).toFixed(0)}% observation floor`);
+                mapped.forEach(d => debugLog(
+                    `  class=${d.className} confidence=${(parseFloat(d.confidence) / 100).toFixed(3)} box=${boxStr(d)}`));
 
-            debugLog(`PLANT CANDIDATES: ${plantCandidates.length}` + (plantCandidates.length
-                ? '  [' + plantCandidates.map(d => `${d.className} ${d.confidence}%`).join(', ') + ']'
-                : ''));
-            debugLog(`PERSON DETECTIONS: ${personDets.length}` +
-                (personDets.length ? '  (ignored - not a plant class, never cancels a plant)' : ''));
-            if (ignored.length) {
-                debugLog(`  non-plant objects ignored: ${ignored.length}  [` +
-                    ignored.map(d => d.className).join(', ') + ']');
-            }
-            debugLog(`PLANT CANDIDATES (passed gate ${(minConfidence * 100).toFixed(0)}%): ` +
-                `${classValidated.length}` + (classValidated.length
-                    ? '  [' + classValidated.map(d => `${d.className} ${d.confidence}% ${boxStr(d)}`).join(' | ') + ']'
+                debugLog(`PLANT CANDIDATES: ${plantCandidates.length}` + (plantCandidates.length
+                    ? '  [' + plantCandidates.map(d => `${d.className} ${d.confidence}%`).join(', ') + ']'
                     : ''));
-            dupsRemoved.forEach(r => debugLog(
-                `DUPLICATE REMOVED: ${r.det.className} ${r.det.confidence}% ${boxStr(r.det)} ` +
-                `- ${r.reason} ${r.metric.toFixed(2)} with kept box ${r.against.confidence}% ` +
-                `${boxStr(r.against)} (same physical plant)`));
-            if (!dupsRemoved.length && classValidated.length > 1) {
-                debugLog(`NMS/DEDUPE: ${classValidated.length} plant boxes, none merged ` +
-                    `- treated as ${classValidated.length} separate plants`);
-            }
+                debugLog(`PERSON DETECTIONS: ${personDets.length}` +
+                    (personDets.length ? '  (ignored - not a plant class, never cancels a plant)' : ''));
+                if (ignored.length) {
+                    debugLog(`  non-plant objects ignored: ${ignored.length}  [` +
+                        ignored.map(d => d.className).join(', ') + ']');
+                }
+                debugLog(`PLANT CANDIDATES (passed gate ${(minConfidence * 100).toFixed(0)}%): ` +
+                    `${classValidated.length}` + (classValidated.length
+                        ? '  [' + classValidated.map(d => `${d.className} ${d.confidence}% ${boxStr(d)}`).join(' | ') + ']'
+                        : ''));
+                dupsRemoved.forEach(r => debugLog(
+                    `DUPLICATE REMOVED: ${r.det.className} ${r.det.confidence}% ${boxStr(r.det)} ` +
+                    `- ${r.reason} ${r.metric.toFixed(2)} with kept box ${r.against.confidence}% ` +
+                    `${boxStr(r.against)} (same physical plant)`));
+                if (!dupsRemoved.length && classValidated.length > 1) {
+                    debugLog(`NMS/DEDUPE: ${classValidated.length} plant boxes, none merged ` +
+                        `- treated as ${classValidated.length} separate plants`);
+                }
 
-            // The verdict, stated explicitly so it never has to be inferred.
-            // (FINAL COUNT is logged after temporal confirmation, in detectFrame.)
-            if (finalDetections.length === 0) {
-                if (plantCandidates.length === 0) {
-                    debugLog(`NO PLANT: no potted-plant detection in this frame.`);
-                    debugLog(`DIAGNOSIS (A): COCO-SSD emitted NO plant-class box at all, ` +
-                        `even down to the ${(DETECTION_CONFIG.observationFloor * 100).toFixed(0)}% ` +
-                        `floor. The MODEL did not see a plant - filtering is not involved. ` +
-                        `COCO's only plant class is "potted plant", trained on potted ` +
-                        `houseplants; foliage on a screen, a cut stem, or a small/distant ` +
-                        `plant often falls outside it. Try base="mobilenet_v2" (current: ` +
-                        `"${DETECTION_CONFIG.cocoBase}") or move the plant closer/larger in frame.`);
-                } else {
-                    debugLog(`NO PLANT: candidate confidence below the ` +
-                        `${(minConfidence * 100).toFixed(0)}% threshold.`);
-                    debugLog(`DIAGNOSIS (B): ${plantCandidates.length} plant-class box(es) WERE ` +
-                        `emitted but scored below the ${(minConfidence * 100).toFixed(0)}% gate ` +
-                        `[` + weakPlants.map(d => `${d.className} ${d.confidence}%`).join(', ') +
-                        `]. This IS a filtering/threshold issue - lower ` +
-                        `DETECTION_CONFIG.scoreThreshold['coco-ssd'].`);
+                // The verdict, stated explicitly so it never has to be inferred.
+                // (FINAL COUNT is logged after temporal confirmation, in detectFrame.)
+                if (finalDetections.length === 0) {
+                    if (plantCandidates.length === 0) {
+                        debugLog(`NO PLANT: no potted-plant detection in this frame.`);
+                        debugLog(`DIAGNOSIS (A): COCO-SSD emitted NO plant-class box at all, ` +
+                            `even down to the ${(DETECTION_CONFIG.observationFloor * 100).toFixed(0)}% ` +
+                            `floor. The MODEL did not see a plant - filtering is not involved. ` +
+                            `COCO's only plant class is "potted plant", trained on potted ` +
+                            `houseplants; foliage on a screen, a cut stem, or a small/distant ` +
+                            `plant often falls outside it. Try base="mobilenet_v2" (current: ` +
+                            `"${DETECTION_CONFIG.cocoBase}") or move the plant closer/larger in frame.`);
+                    } else {
+                        debugLog(`NO PLANT: candidate confidence below the ` +
+                            `${(minConfidence * 100).toFixed(0)}% threshold.`);
+                        debugLog(`DIAGNOSIS (B): ${plantCandidates.length} plant-class box(es) WERE ` +
+                            `emitted but scored below the ${(minConfidence * 100).toFixed(0)}% gate ` +
+                            `[` + weakPlants.map(d => `${d.className} ${d.confidence}%`).join(', ') +
+                            `]. This IS a filtering/threshold issue - lower ` +
+                            `DETECTION_CONFIG.scoreThreshold['coco-ssd'].`);
+                    }
                 }
             }
 
@@ -1363,8 +1522,10 @@ const Visualizer = {
             this.ctx.restore();
 
             // Draw background for text
-            const labelText = `${detection.className} ${detection.confidence}%` +
-                (weak ? ' (weak)' : '');
+            // User-facing label. The raw COCO class name ("potted plant") is
+            // an implementation detail of the detector, so the box says PLANT.
+            // detection.className itself is untouched.
+            const labelText = `PLANT ${detection.confidence}%`;
             this.ctx.font = 'bold 14px Arial';
             const textWidth = this.ctx.measureText(labelText).width;
             const textHeight = 24;
@@ -1395,8 +1556,8 @@ const Visualizer = {
         // NOTE: the diagnostics used to be painted onto this canvas, which meant
         // an opaque black panel sat on top of the video (and scaled with the
         // camera's native resolution, so it was tiny on a 1280x720 feed). They
-        // now live in the #debugOverlay DOM element instead - see
-        // UIManager.updateDebugOverlay().
+        // were removed from the UI entirely - they were developer
+        // diagnostics. The data is still on DetectionEngine.lastPipelineStats.
     }
 };
 
@@ -1405,10 +1566,56 @@ const Visualizer = {
 // ============================================================================
 
 const PerformanceMonitor = {
+    // ---- counters -----------------------------------------------------------
     cameraFrames: 0,
     cameraLastTime: performance.now(),
     inferenceFrames: 0,
     inferenceLastTime: performance.now(),
+    skippedFrames: 0,          // frames where a cycle was still in flight
+    cycles: 0,
+    cycleMsTotal: 0,           // full pipeline: stage 1 + stage 2 + draw + UI
+    cycleMsEma: 0,
+    lastCycleMs: 0,
+    summaryLastTime: performance.now(),
+
+    // ---- adaptive inference rate --------------------------------------------
+    // Target band from the spec: 8-12 inference FPS. The interval is nudged
+    // toward whatever this particular device can actually sustain, using the
+    // measured full-cycle time - a healthy desktop settles at the 8 FPS ceiling,
+    // a weak phone backs off toward 5 FPS instead of thrashing. ONLY the frequency
+    // adapts: no threshold, class filter, NMS or dedupe setting is touched, so
+    // detection quality is identical at every rate.
+    //
+    // MEASURED, not guessed. A 20s headless bench (_probe/bench.html, fixed-cost
+    // model stubs, 5 runs per point) swept this ceiling and found preview
+    // smoothness falls off sharply above ~8 inference FPS on this hardware:
+    //     83ms (12fps) -> 46 UI fps, 23.0% janky frames
+    //    100ms (10fps) -> 48 UI fps, 19.5%
+    //    120ms (8fps)  -> 58 UI fps, 13.9%   <- knee
+    //    143ms (7fps)  -> 52 UI fps, 13.3%   (no further gain)
+    // Running detect() 32% more often consumed the whole main-thread saving from
+    // the logging/throttle work and then some, leaving the preview WORSE than
+    // before it. 120ms keeps the saving in the preview, where lag is felt; the
+    // tracker and box smoothing already carry detection across frames, so a
+    // near-static plant loses nothing at 8 FPS.
+    minIntervalMs: 120,        // ceiling: ~8 inference FPS
+    maxIntervalMs: 200,        // floor:   ~5 inference FPS on a slow device
+    detectionIntervalMs: 120,  // start at the ceiling and back off if needed
+
+    reset() {
+        this.cameraFrames = 0;
+        this.inferenceFrames = 0;
+        this.skippedFrames = 0;
+        this.cycles = 0;
+        this.cycleMsTotal = 0;
+        this.cycleMsEma = 0;
+        this.lastCycleMs = 0;
+        this.detectionIntervalMs = 100;
+        const now = performance.now();
+        this.cameraLastTime = now;
+        this.inferenceLastTime = now;
+        this.summaryLastTime = now;
+    },
 
     recordCameraFrame() {
         this.cameraFrames++;
@@ -1428,6 +1635,89 @@ const PerformanceMonitor = {
             this.inferenceFrames = 0;
             this.inferenceLastTime = now;
         }
+    },
+
+    // Called once per completed cycle, from runDetection's finally block.
+    recordCycle(ms) {
+        this.lastCycleMs = ms;
+        this.cycles++;
+        this.cycleMsTotal += ms;
+        // EMA so one slow frame does not swing the rate; alpha 0.2 ~ 5 cycles.
+        this.cycleMsEma = this.cycleMsEma ? 0.2 * ms + 0.8 * this.cycleMsEma : ms;
+        this.adapt();
+        this.maybeLogSummary();
+    },
+
+    // Keep roughly `headroom` of each interval free for the compositor, the
+    // video, and the rest of the page - that free time is what keeps the
+    // preview smooth. If a cycle costs more than the interval allows, stretch
+    // the interval; if there is spare capacity, tighten it back toward 12 FPS.
+    adapt() {
+        // 2.2x, i.e. keep ~55% of every interval free. 1.35x (35% free) was not
+        // enough: `cycleMsEma` is WALL-CLOCK for the whole cycle, so a cycle that
+        // is partly an awaited GPU readback looks cheaper to this controller than
+        // it is to the compositor. Over-reserving errs toward a smooth preview,
+        // which is the point of adapting at all.
+        const headroom = 2.2;
+        const wanted = this.cycleMsEma * headroom;
+        const target = Math.min(this.maxIntervalMs, Math.max(this.minIntervalMs, wanted));
+        // Move gradually - a jumpy interval is itself visible as stutter.
+        this.detectionIntervalMs += (target - this.detectionIntervalMs) * 0.25;
+    },
+
+    avgCycleMs() {
+        return this.cycles ? this.cycleMsTotal / this.cycles : 0;
+    },
+
+    tensorMemory() {
+        try {
+            if (typeof tf === 'undefined' || !tf.memory) return null;
+            const m = tf.memory();
+            return { tensors: m.numTensors, mb: m.numBytes / 1048576 };
+        } catch (err) {
+            return null;
+        }
+    },
+
+    // ONE throttled line every `summaryIntervalMs`, not per frame. This is the
+    // production-safe replacement for the ~20 per-frame console.log calls the
+    // detection path used to emit.
+    summaryIntervalMs: 5000,
+    maybeLogSummary() {
+        if (!DETECTION_CONFIG.perfSummary) return;
+        const now = performance.now();
+        if (now - this.summaryLastTime < this.summaryIntervalMs) return;
+        this.summaryLastTime = now;
+
+        const mem = this.tensorMemory();
+        infoLog(`Camera FPS: ${StatsManager.cameraFps}`);
+        infoLog(`AI inference FPS: ${StatsManager.inferenceFps} ` +
+            `(interval ${this.detectionIntervalMs.toFixed(0)}ms)`);
+        infoLog(`Inference time: ${StatsManager.inferenceTime.toFixed(1)} ms`);
+        infoLog(`Average inference time: ${this.avgCycleMs().toFixed(1)} ms (full cycle, ${this.cycles} cycles)`);
+        infoLog(`Tensor memory: ${mem ? `${mem.tensors} tensors, ${mem.mb.toFixed(1)} MB` : 'n/a'}`);
+        infoLog(`Skipped frames: ${this.skippedFrames}`);
+        infoLog(`Model 2 inference time: ${PlantAnalyzer.available
+            ? `${PlantAnalyzer.inferenceTime.toFixed(1)} ms (last cycle, ${PlantAnalyzer.runs} runs)`
+            : 'n/a (model not installed)'}`);
+    },
+
+    snapshot() {
+        const mem = this.tensorMemory();
+        return {
+            cameraFps: StatsManager.cameraFps,
+            inferenceFps: StatsManager.inferenceFps,
+            inferenceMs: +StatsManager.inferenceTime.toFixed(1),
+            avgCycleMs: +this.avgCycleMs().toFixed(1),
+            lastCycleMs: +this.lastCycleMs.toFixed(1),
+            intervalMs: +this.detectionIntervalMs.toFixed(0),
+            cycles: this.cycles,
+            skippedFrames: this.skippedFrames,
+            tensors: mem ? mem.tensors : null,
+            tensorMB: mem ? +mem.mb.toFixed(1) : null,
+            model2Ms: +PlantAnalyzer.inferenceTime.toFixed(1),
+            model2Runs: PlantAnalyzer.runs
+        };
     }
 };
 
@@ -1485,17 +1775,16 @@ const UIManager = {
         modelError: null
     },
 
-    // Cap inference well below camera FPS (Step 7): even if a frame infers in
-    // a few ms, running the model on every camera frame (up to 30-60/s) would
-    // fight the main thread for no benefit. ~8 FPS is plenty for a hand-held
-    // plant to track visibly while keeping the tab responsive.
-    minDetectionIntervalMs: 120,
+    // When the last inference cycle STARTED. The interval itself is adaptive
+    // and lives on PerformanceMonitor (see detectionIntervalMs / adapt()), so
+    // a slow phone and a fast desktop each settle at a rate they can sustain
+    // instead of both being pinned to one hard-coded number.
     lastDetectionAt: 0,
+    inferenceErrors: 0,
 
     init() {
         this.setupEventListeners();
         this.updateAllStatus();
-        this.updateDebugOverlay(StatsManager.getStats());
     },
 
     setupEventListeners() {
@@ -1506,28 +1795,43 @@ const UIManager = {
     },
 
     async startCamera() {
-        if (!this.state.cameraReady) {
-            const success = await CameraManager.init();
-            if (!success) return;
-            this.state.cameraReady = true;
-        }
+        // The button is only disabled inside updateAllStatus(), which runs
+        // AFTER these awaits - so without this guard a second click during
+        // camera init started a second render loop that never went away.
+        if (this.startingCamera || this.state.cameraRunning) return;
+        this.startingCamera = true;
+        try {
+            if (!this.state.cameraReady) {
+                const success = await CameraManager.init();
+                if (!success) return;
+                this.state.cameraReady = true;
+            }
 
-        const started = await CameraManager.start();
-        if (started) {
-            this.state.cameraRunning = true;
-            this.updateAllStatus();
-            this.hideOverlay();
-
-            // Start animation loop
-            this.animationLoop();
+            const started = await CameraManager.start();
+            if (started) {
+                this.state.cameraRunning = true;
+                this.updateAllStatus();
+                this.hideOverlay();
+                PerformanceMonitor.reset();
+                // startLoop() is idempotent - it can never create a second loop.
+                this.startLoop();
+            }
+        } finally {
+            this.startingCamera = false;
         }
     },
 
     stopCamera() {
-        CameraManager.stop();
-        PlantTracker.reset();
+        // Order matters: clear cameraRunning first so an already-queued rAF
+        // callback exits immediately, then cancel the pending handle so no
+        // further frame is scheduled at all.
         this.state.cameraRunning = false;
         this.state.detectionActive = false;
+        this.stopLoop();
+        CameraManager.stop();          // stops the MediaStream tracks
+        PlantAnalyzer.releaseScratch();
+        PlantTracker.reset();
+        this.inferenceErrors = 0;
         this.updateAllStatus();
         Visualizer.clear();
         this.updateNoPlantPopup(0); // camera off -> hide the popup
@@ -1551,6 +1855,8 @@ const UIManager = {
         // Start from a clean slate - stale tracks from a previous run must not
         // confirm a plant that is no longer in front of the camera.
         PlantTracker.reset();
+        PlantAnalyzer.resetCache();     // track ids restart at 1 - drop stale verdicts
+        PerformanceMonitor.reset();
         this.state.detectionActive = true;
         this.updateAllStatus();
     },
@@ -1558,6 +1864,7 @@ const UIManager = {
     stopDetection() {
         this.state.detectionActive = false;
         PlantTracker.reset();
+        PlantAnalyzer.resetCache();
         this.updateAllStatus();
         Visualizer.clear();
         StatsManager.detections = [];
@@ -1565,75 +1872,135 @@ const UIManager = {
         this.updateNoPlantPopup(0);        // detection stopped -> hide the popup
     },
 
-    isDetecting: false,
+    // ---- Inference scheduling ------------------------------------------
+    // The camera preview is driven by requestAnimationFrame and NEVER waits on
+    // the model. Inference is fired from inside that loop at a controlled
+    // interval, and a frame is simply skipped whenever a cycle is still in
+    // flight - so a slow inference costs one skipped detection, never a stalled
+    // preview.
+    isDetecting: false,     // hard lock - exactly one inference cycle at a time
+    loopHandle: null,       // rAF handle, so the loop can actually be cancelled
+    loopRunning: false,     // guarantees exactly one loop exists
+    startingCamera: false,  // re-entrancy guard against double-clicking START
+
+    // Exactly one rAF loop, whatever the user clicks. Previously startCamera()
+    // called animationLoop() directly, so double-clicking START CAMERA while
+    // the getUserMedia await was still pending started a SECOND loop - two
+    // loops then scheduled inference against one lock forever.
+    startLoop() {
+        if (this.loopRunning) return;
+        this.loopRunning = true;
+        this.animationLoop();
+    },
+
+    stopLoop() {
+        if (this.loopHandle !== null) cancelAnimationFrame(this.loopHandle);
+        this.loopHandle = null;
+        this.loopRunning = false;
+    },
 
     animationLoop() {
-        if (!this.state.cameraRunning) return;
+        if (!this.state.cameraRunning) {
+            this.loopRunning = false;
+            this.loopHandle = null;
+            return;
+        }
 
         PerformanceMonitor.recordCameraFrame();
 
         const now = performance.now();
-        if (this.state.detectionActive && !this.isDetecting && now - this.lastDetectionAt >= this.minDetectionIntervalMs) {
-            const frame = CameraManager.getFrame();
-            if (frame && frame.readyState === frame.HAVE_ENOUGH_DATA) {
-                this.lastDetectionAt = now;
-                this.runDetection(frame);
+        if (this.state.detectionActive &&
+            now - this.lastDetectionAt >= PerformanceMonitor.detectionIntervalMs) {
+            if (this.isDetecting) {
+                // A cycle is still running. Skip this frame rather than queueing
+                // - queueing is what builds an unbounded backlog and freezes the
+                // preview. The skip count feeds the adaptive rate.
+                PerformanceMonitor.skippedFrames++;
+            } else {
+                const frame = CameraManager.getFrame();
+                if (frame && frame.readyState === frame.HAVE_ENOUGH_DATA) {
+                    this.lastDetectionAt = now;
+                    // Deliberately NOT awaited: awaiting here would tie the
+                    // preview's frame rate to the model's.
+                    this.runDetection(frame);
+                }
             }
         }
 
-        requestAnimationFrame(() => this.animationLoop());
+        this.loopHandle = requestAnimationFrame(() => this.animationLoop());
     },
 
     async runDetection(frame) {
+        // The lock is held across the WHOLE cycle - Stage 1, Stage 2, drawing
+        // and the UI update. It used to be released immediately after Stage 1,
+        // so the next rAF tick could start a second cycle while Model 2 was
+        // still classifying: two pipelines competing for the main thread, which
+        // is exactly the "queue of inference operations" that stutters.
+        //
+        // try/finally means a thrown error can never strand the lock. Before,
+        // one rejected promise would leave isDetecting permanently true and
+        // detection would be dead until the page reloaded.
         this.isDetecting = true;
-        let detections = await DetectionEngine.detectFrame(frame);
-        this.isDetecting = false;
-        if (!Array.isArray(detections)) detections = [];
+        const cycleStart = performance.now();
+        try {
+            let detections = await DetectionEngine.detectFrame(frame);
+            if (!Array.isArray(detections)) detections = [];
 
-        // STAGE 2: for each plant Model 1 validated, crop that box out of the
-        // frame and analyse it independently. Only runs when Model 2 is
-        // installed; skipped entirely otherwise. Detections with no fresh
-        // analysis inherit the previous frame's verdict by box overlap.
-        if (PlantAnalyzer.available && detections.length) {
-            const previous = StatsManager.detections;
-            await PlantAnalyzer.analyzeDetections(frame, detections);
-            PlantAnalyzer.carryForward(previous, detections);
+            // STAGE 2: for each plant Model 1 validated, crop that box out of the
+            // frame and analyse it independently. Only runs when Model 2 is
+            // installed; skipped entirely otherwise. Detections with no fresh
+            // analysis inherit the previous frame's verdict by box overlap.
+            if (PlantAnalyzer.available && detections.length) {
+                const previous = StatsManager.detections;
+                await PlantAnalyzer.analyzeDetections(frame, detections);
+                PlantAnalyzer.carryForward(previous, detections);
+            }
+
+            // REPLACE (never merge) the detection list every frame. An empty array
+            // here fully clears the previous frame's boxes, list, stats and
+            // "N PLANTS DETECTED" message - so a no-plant frame right after a
+            // plant frame reads "NO PLANT DETECTED", not the stale count.
+            StatsManager.updateDetections(detections);
+            PerformanceMonitor.recordInferenceFrame();
+
+            Visualizer.drawDetections(detections); // clears the canvas first, then draws only these
+            this.updateDetectionUI();
+
+            if (this.inferenceErrors) {
+                this.inferenceErrors = 0;
+                this.updateAllStatus();
+            }
+        } catch (err) {
+            // A failed inference must never stop the camera or the loop. Report
+            // it, keep going, and let the next frame try again.
+            this.inferenceErrors = (this.inferenceErrors || 0) + 1;
+            if (this.inferenceErrors === 1 || this.inferenceErrors % 25 === 0) {
+                console.error(`[AGRIVISION] Inference failed (${this.inferenceErrors} consecutive) - ` +
+                    `camera and loop continue:`, err);
+            }
+            if (this.inferenceErrors === 3) this.updateAllStatus();
+        } finally {
+            this.isDetecting = false;
+            PerformanceMonitor.recordCycle(performance.now() - cycleStart);
+            this.updateStats();
         }
-
-        // REPLACE (never merge) the detection list every frame. An empty array
-        // here fully clears the previous frame's boxes, list, stats and
-        // "N PLANTS DETECTED" message - so a no-plant frame right after a
-        // plant frame reads "NO PLANT DETECTED", not the stale count.
-        StatsManager.updateDetections(detections);
-        PerformanceMonitor.recordInferenceFrame();
-
-        Visualizer.drawDetections(detections); // clears the canvas first, then draws only these
-        this.updateDetectionUI();
-        this.updateStats();
     },
 
     updateAllStatus() {
         // Header mode badge - the app runs only in live camera mode.
         const modeBadge = document.getElementById('modeBadge');
-        modeBadge.textContent = 'LIVE MODE';
+        if (modeBadge) modeBadge.textContent = 'LIVE MODE';
 
-        // Status indicator
-        const indicator = document.getElementById('statusIndicator');
-        const statusText = indicator.querySelector('.status-text');
-        const statusDot = indicator.querySelector('.status-dot');
-
-        if (this.state.detectionActive) {
-            statusText.textContent = 'DETECTING';
-            statusDot.classList.add('online');
-        } else if (this.state.cameraRunning) {
-            statusText.textContent = 'CAMERA READY';
-            statusDot.classList.add('online');
-        } else {
-            statusText.textContent = 'STANDBY';
-            statusDot.classList.remove('online');
-        }
-
-        // Button states
+        // Button states. What the user can do next is the only "status" they
+        // need, so this is all that is painted here now.
+        //
+        // The SYSTEM STATUS card (Camera / AI Engine / Detection / Mode badges),
+        // the header STANDBY-DETECTING indicator and the Model readout were
+        // developer diagnostics and have been removed from the UI. Note that
+        // `this.state` is NOT removed and is still maintained exactly as before:
+        // it drives the buttons below, the model-readiness line in the PLANT
+        // DETECTION panel and the popup, and it stays readable from the console
+        // as AGRIVISION.ui.state. Only the presentation was dropped.
         const startCameraBtn = document.getElementById('startCameraBtn');
         const stopCameraBtn = document.getElementById('stopCameraBtn');
         const startDetectionBtn = document.getElementById('startDetectionBtn');
@@ -1644,166 +2011,175 @@ const UIManager = {
         startDetectionBtn.disabled = !this.state.cameraRunning || this.state.detectionActive;
         stopDetectionBtn.disabled = !this.state.detectionActive;
 
-        // System status panel
-        document.getElementById('cameraStatus').textContent = this.state.cameraRunning ? 'ONLINE' : 'OFFLINE';
-        document.getElementById('cameraStatus').className = this.state.cameraRunning ? 'status-badge online' : 'status-badge';
+        // Model readiness now reaches the user as one plain-language line in the
+        // PLANT DETECTION panel instead of an engine/status table, so refresh
+        // that panel whenever readiness changes.
+        this.updateDetectionUI();
+    },
 
-        const aiStatusEl = document.getElementById('aiStatus');
-        if (this.state.modelReady) {
-            aiStatusEl.textContent = 'READY';
-            aiStatusEl.className = 'status-badge ready';
-            aiStatusEl.title = '';
-        } else if (this.state.modelStatus === 'error') {
-            aiStatusEl.textContent = 'ERROR';
-            aiStatusEl.className = 'status-badge error';
-            aiStatusEl.title = this.state.modelError || 'Model failed to load';
-        } else {
-            aiStatusEl.textContent = 'LOADING';
-            aiStatusEl.className = 'status-badge loading';
-            aiStatusEl.title = '';
+    // Cached DOM handles + last-written values. Every write to the DOM is layout
+    // work on the same main thread the camera preview needs, so the rule here is:
+    // touch the DOM only when the value it would show has actually changed.
+    dom: null,
+    lastUi: { indicator: null, count: null, conf: null, healthSig: null },
+    lastUiPaintAt: 0,
+
+    cacheDom() {
+        if (this.dom) return this.dom;
+        this.dom = {
+            summary: document.getElementById('detectionSummary'),
+            count: document.getElementById('plantCountValue'),
+            conf: document.getElementById('confidenceValue'),
+            health: document.getElementById('plantHealth')
+        };
+        this.dom.indicator = this.dom.summary.querySelector('.summary-indicator');
+        this.dom.indicatorText = this.dom.indicator.querySelector('.indicator-text');
+        return this.dom;
+    },
+
+    // Escape anything interpolated into innerHTML below. Crop and condition
+    // names come from model/class_names.json, so this is belt-and-braces rather
+    // than a live risk - but they are model metadata, not literals.
+    esc(v) {
+        return String(v).replace(/[&<>"']/g, c => (
+            { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    },
+
+    // A cheap signature of everything the PLANT HEALTH section renders. If it is
+    // unchanged the markup would be byte-identical, so rebuilding it is pure
+    // cost - this is the single most expensive DOM operation in the pipeline.
+    healthSignature(detections) {
+        if (!PlantAnalyzer.available) return 'unavailable:' + PlantAnalyzer.status;
+        if (!detections.length) return 'empty';
+        let sig = String(detections.length) + ':';
+        for (const d of detections) {
+            const a = d.analysis;
+            sig += a
+                ? `${a.uncertain ? 'U' : ''}${a.crop}${a.health}${a.condition}` +
+                  `${a.conditionConfidence.toFixed(2)};`
+                : '-;';
         }
-
-        document.getElementById('detectionStatus').textContent = this.state.detectionActive ? 'ACTIVE' : 'PAUSED';
-        document.getElementById('detectionStatus').className = this.state.detectionActive ? 'status-badge active' : 'status-badge paused';
-
-        document.getElementById('modeStatus').textContent = 'LIVE';
-        document.getElementById('modeStatus').className = 'status-badge';
-
-        const modelLabel = DetectionEngine.engineType === 'custom' ? 'CUSTOM' : 'COCO-SSD';
-        document.getElementById('modelValue').textContent = this.state.modelReady ? modelLabel : '--';
+        return sig;
     },
 
     updateDetectionUI() {
         const stats = StatsManager.getStats();
-        const detectionSummary = document.getElementById('detectionSummary');
-        const detectionsList = document.getElementById('detectionsList');
+        const d = this.cacheDom();
+        const last = this.lastUi;
 
-        // Update summary indicator. The message is driven purely by
-        // stats.plantCount, which is StatsManager.detections.length - the final
-        // class-validated, de-duplicated plant list for the CURRENT frame. The
-        // coloured dot is handled by the .detected / .offline class, so the text
-        // is exactly the spec string with no decoration.
-        const indicator = detectionSummary.querySelector('.summary-indicator');
-        const indicatorText = indicator.querySelector('.indicator-text');
-        if (stats.plantCount === 0) {
-            indicator.classList.add('offline');
-            indicator.classList.remove('detected');
-            indicatorText.textContent = 'NO PLANT DETECTED';
+        // ---- status line ---------------------------------------------------
+        // Binary by design: the NUMBER lives in its own row below, so this line
+        // answers only "is there a plant in front of the camera". It is driven
+        // purely by stats.plantCount, which is StatsManager.detections.length -
+        // the final class-validated, de-duplicated, temporally confirmed plant
+        // list for the current frame. A person in frame is rejected by CLASS, so
+        // a person can never suppress a plant that is also there.
+        //
+        // The two model-readiness states are not detection results; they exist
+        // so the user is told why START DETECTION is unavailable, rather than
+        // being shown "NO PLANT DETECTED" by a detector that has not loaded yet.
+        let indicatorText;
+        if (this.state.modelStatus === 'error') {
+            indicatorText = '\u26A0\uFE0F DETECTION UNAVAILABLE';
+        } else if (!this.state.modelReady) {
+            indicatorText = 'PREPARING AI MODEL\u2026';
         } else {
-            indicator.classList.remove('offline');
-            indicator.classList.add('detected');
-            indicatorText.textContent =
-                `${stats.plantCount} PLANT${stats.plantCount === 1 ? '' : 'S'} DETECTED`;
+            indicatorText = stats.plantCount === 0
+                ? '\u26A0\uFE0F NO PLANT DETECTED'
+                : '\u2705 PLANT DETECTED';
+        }
+        if (indicatorText !== last.indicator) {
+            last.indicator = indicatorText;
+            d.indicatorText.textContent = indicatorText;
+            d.indicator.classList.toggle('offline', stats.plantCount === 0);
+            d.indicator.classList.toggle('detected', stats.plantCount > 0);
         }
 
-        // Update statistics
-        document.getElementById('plantCountValue').textContent = stats.plantCount;
-        document.getElementById('highestConfValue').textContent = stats.highestConfidence + '%';
-        document.getElementById('avgConfValue').textContent = stats.averageConfidence + '%';
+        // ---- count + confidence --------------------------------------------
+        // Each guarded, so an unchanged value costs no layout. Highest
+        // confidence is now shown simply as "Confidence"; the separate
+        // average-confidence statistic was a developer metric and is gone from
+        // the UI. StatsManager still computes both.
+        const countStr = String(stats.plantCount);
+        if (countStr !== last.count) { last.count = countStr; d.count.textContent = countStr; }
+        const confStr = stats.highestConfidence === '--'
+            ? '--'
+            : `${Math.round(parseFloat(stats.highestConfidence))}%`;
+        if (confStr !== last.conf) { last.conf = confStr; d.conf.textContent = confStr; }
 
-        // Update detections list
-        if (stats.plantCount === 0) {
-            detectionsList.innerHTML = '<div class="empty-state">No plants detected</div>';
-        } else {
-            detectionsList.innerHTML = StatsManager.detections.map((det, idx) => `
-                <div class="detection-item">
-                    <div class="detection-head">
-                        <span class="detection-name">PLANT ${idx + 1}${
-                            det.uncertain ? ' <span class="weak-badge">WEAK</span>' : ''}</span>
-                        <span class="detection-confidence">${det.confidence}%</span>
-                    </div>
-                    ${this.renderAnalysis(det.analysis)}
-                </div>
-            `).join('');
+        // ---- Model 2 --------------------------------------------------------
+        const sig = this.healthSignature(StatsManager.detections);
+        if (sig !== last.healthSig) {
+            last.healthSig = sig;
+            d.health.innerHTML = this.healthMarkup(StatsManager.detections);
         }
 
         // Drive the "NO PLANT DETECTED" popup from the SAME final count.
+        // (updateNoPlantPopup is already transition-only.)
         this.updateNoPlantPopup(stats.plantCount);
-        this.updateDebugOverlay(stats);
     },
 
-    // Model 2's verdict for one plant. Three states, and the module never
-    // invents a diagnosis: if Model 2 is not installed we say so, and if it is
-    // installed but not confident we say ANALYSIS UNCERTAIN rather than
-    // reporting a crop or a disease it cannot stand behind.
-    renderAnalysis(analysis) {
+    // Model 2's verdict. Three honest states and no fabrication: if the trained
+    // classifier is not installed we say so, if it is installed but not
+    // confident we say ANALYSIS UNCERTAIN, and only a confident verdict ever
+    // shows a crop or a condition.
+    healthMarkup(detections) {
         if (!PlantAnalyzer.available) {
-            return `<div class="analysis analysis-off">Analysis model not installed</div>`;
+            const msg = PlantAnalyzer.status === 'error'
+                ? 'HEALTH MODEL NOT AVAILABLE'
+                : 'WAITING FOR HEALTH MODEL';
+            return `<div class="health-note health-note--muted">${msg}</div>`;
         }
-        if (!analysis) {
-            return `<div class="analysis analysis-off">Analysing…</div>`;
+        if (!detections.length) {
+            return `<div class="health-note">Waiting for plant detection\u2026</div>`;
         }
-        if (analysis.uncertain) {
-            return `
-                <div class="analysis analysis-uncertain">
-                    <div class="analysis-title">⚠️ ANALYSIS UNCERTAIN</div>
-                    <div class="analysis-note">Move closer or steady the camera.</div>
-                </div>`;
-        }
-        const pct = v => `${(v * 100).toFixed(0)}%`;
-        const unhealthy = analysis.health === 'Unhealthy';
-        return `
-            <div class="analysis">
-                <div class="analysis-row">
-                    <span class="analysis-key">Crop</span>
-                    <span class="analysis-val">${analysis.crop}
-                        <em>${pct(analysis.cropConfidence)}</em></span>
-                </div>
-                <div class="analysis-row">
-                    <span class="analysis-key">Health</span>
-                    <span class="analysis-val ${unhealthy ? 'is-unhealthy' : 'is-healthy'}">
-                        ${unhealthy ? '⚠️ ' : ''}${analysis.health.toUpperCase()}
-                        <em>${pct(analysis.healthConfidence)}</em></span>
-                </div>
-                <div class="analysis-row">
-                    <span class="analysis-key">${unhealthy ? 'Possible condition' : 'Condition'}</span>
-                    <span class="analysis-val">${analysis.condition}
-                        <em>${pct(analysis.conditionConfidence)}</em></span>
-                </div>
-            </div>`;
+        return detections.map((det, i) => this.healthCard(det, i, detections.length)).join('');
     },
 
-    // Live blue diagnostics over the camera feed. Read-only view of state that
-    // already exists - it does not touch the detection pipeline in any way.
-    updateDebugOverlay(stats) {
-        const overlay = document.getElementById('debugOverlay');
-        if (!overlay) return;
+    healthCard(det, idx, total) {
+        // The plant number is only meaningful when there is more than one; the
+        // spec's single-plant layout is exactly this card without it.
+        const label = total > 1
+            ? `<div class="health-plant">PLANT ${idx + 1}</div>`
+            : '';
+        const a = det.analysis;
 
-        overlay.hidden = !DETECTION_CONFIG.debugHud;
-        if (!DETECTION_CONFIG.debugHud) return;
-
-        const s = DetectionEngine.lastPipelineStats;
-        const set = (id, value) => {
-            const el = document.getElementById(id);
-            if (el) el.textContent = value;
-        };
-
-        const engine = s ? s.engine.toUpperCase() : (DetectionEngine.engineType || '--').toUpperCase();
-
-        set('dbgEngine', engine);
-        set('dbgRaw', s ? s.raw : 0);
-        // "VALID" is the CANDIDATE level: class-valid, above the gate, deduped -
-        // but not yet temporally confirmed. dbgFinal is the CONFIRMED count,
-        // which is what the counter and the popup use.
-        set('dbgValid', s ? (s.candidates ?? s.afterClass ?? 0) : 0);
-        set('dbgFinal', stats.plantCount);
-        set('dbgConf', stats.highestConfidence === '--' ? '--' : `${stats.highestConfidence}%`);
-        set('dbgTime', `${StatsManager.inferenceTime.toFixed(0)} ms`);
-
-        const statusEl = document.getElementById('dbgStatus');
-        if (statusEl) {
-            if (!this.state.detectionActive) {
-                statusEl.textContent = 'IDLE';
-                statusEl.className = 'debug-value';
-            } else if (stats.plantCount === 0) {
-                statusEl.textContent = 'NO PLANT DETECTED';
-                statusEl.className = 'debug-value no-plants';
-            } else {
-                statusEl.textContent =
-                    `${stats.plantCount} PLANT${stats.plantCount === 1 ? '' : 'S'} DETECTED`;
-                statusEl.className = 'debug-value has-plants';
-            }
+        if (!a) {
+            return `<div class="health-block">${label}` +
+                   `<div class="health-note">Analysing\u2026</div></div>`;
         }
+        if (a.uncertain) {
+            return `<div class="health-block">${label}
+                <div class="health-uncertain">
+                    <div class="health-uncertain-title">\u26A0\uFE0F ANALYSIS UNCERTAIN</div>
+                    <div class="health-note">Please provide a clearer view of the plant.</div>
+                </div></div>`;
+        }
+
+        const e = v => this.esc(v);
+        const unhealthy = a.health === 'Unhealthy';
+        // Headline confidence is the top-1 class probability - the model's
+        // actual prediction. Crop and health are marginalisations of that same
+        // distribution, so this is the number that stands behind the verdict.
+        const pct = `${Math.round(a.conditionConfidence * 100)}%`;
+        return `<div class="health-block">${label}
+            <div class="health-row">
+                <span class="health-key">Crop</span>
+                <span class="health-val">${e(a.crop)}</span>
+            </div>
+            <div class="health-row">
+                <span class="health-key">Health</span>
+                <span class="health-val ${unhealthy ? 'is-unhealthy' : 'is-healthy'}">${e(a.health)}</span>
+            </div>
+            <div class="health-row">
+                <span class="health-key">Condition</span>
+                <span class="health-val">${e(a.condition)}</span>
+            </div>
+            <div class="health-row">
+                <span class="health-key">Confidence</span>
+                <span class="health-val">${pct}</span>
+            </div>
+        </div>`;
     },
 
     // Popup state - tracked so the debug lines only fire on a transition, not
@@ -1833,10 +2209,16 @@ const UIManager = {
             : 'Plant detected — hiding NO PLANT popup');
     },
 
+    // The stats row is refreshed on a fixed cadence, not once per inference.
+    // The FPS counters themselves only change once a second anyway.
+    lastStatsAt: 0,
     updateStats() {
-        document.getElementById('cameraFpsValue').textContent = StatsManager.cameraFps;
-        document.getElementById('inferenceFpsValue').textContent = StatsManager.inferenceFps;
-        document.getElementById('inferenceTimeValue').textContent = StatsManager.inferenceTime.toFixed(1) + ' ms';
+        // The Camera FPS / Inference FPS / Inference Time readouts were
+        // developer statistics and are no longer in the UI. PerformanceMonitor
+        // still measures all three - they drive the adaptive inference rate and
+        // the throttled console summary - so there is simply nothing to paint.
+        // Kept as a named no-op because runDetection's finally block calls it
+        // every cycle and the detection pipeline is deliberately left untouched.
     },
 
     hideOverlay() {
@@ -1884,7 +2266,6 @@ async function initializeApp() {
     UIManager.updateAllStatus();
     // Engine name is only known once loading finishes - refresh the blue
     // diagnostics so it reads e.g. "ENGINE: COCO-SSD" before detection starts.
-    UIManager.updateDebugOverlay(StatsManager.getStats());
 
     if (modelReady) {
         debugLog(`AGRIVISION ready. Engine: ${DetectionEngine.engineType}. Click START CAMERA to begin.`);
@@ -1892,6 +2273,32 @@ async function initializeApp() {
         debugLog('AGRIVISION model failed to load. Real detection unavailable until this is fixed:', DetectionEngine.errorMessage);
     }
 }
+
+// ----------------------------------------------------------------------------
+// Console handle. script.js declares its modules with top-level `const`, which
+// is script scope and therefore NOT reachable from the console or from a test
+// harness. This one global exposes them read-only for diagnostics - it changes
+// no behaviour and touches no UI.
+//
+//   AGRIVISION.perf()            -> live FPS / timings / tensor count
+//   AGRIVISION.setVerbose(true)  -> re-enable the per-frame detection log
+// ----------------------------------------------------------------------------
+window.AGRIVISION = {
+    get verbose() { return VERBOSE_LOGGING; },
+    setVerbose(on) {
+        VERBOSE_LOGGING = !!on;
+        infoLog(`Verbose per-frame logging ${VERBOSE_LOGGING ? 'ENABLED' : 'disabled'}.`);
+        return VERBOSE_LOGGING;
+    },
+    perf: () => PerformanceMonitor.snapshot(),
+    config: DETECTION_CONFIG,
+    engine: DetectionEngine,
+    analyzer: PlantAnalyzer,
+    tracker: PlantTracker,
+    stats: StatsManager,
+    ui: UIManager,
+    monitor: PerformanceMonitor
+};
 
 // Start the application when DOM is ready
 if (document.readyState === 'loading') {

@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#020617">
     <meta name="color-scheme" content="dark">
     <title>AGRIVISION - Plant Detection System</title>
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="/style.css">
 </head>
 <body>
     <!-- Decorative depth layer: soft blurred orbs behind the glass UI. Fixed,
@@ -142,7 +142,47 @@
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/dist/tf-tflite.min.js"></script>
 
+    <!-- BENCH STUBS. Replace ONLY the two model libraries with fixed-cost fakes so
+         the pipeline can be timed on a machine with no GPU. Real window.tf is kept
+         (cropToTensor genuinely uses it). script.js is loaded unmodified. -->
+    <script>
+    (function () {
+      const q = new URLSearchParams(location.search);
+      const SYNC_MS  = +(q.get('sync')  || 30);   // main-thread cost of one detect()
+      const ASYNC_MS = +(q.get('async') || 20);   // awaited (GPU readback) cost
+      const NPLANT   = +(q.get('plants') || 2);
+      window.__bench = { detects: 0, model2: 0 };
+      const spin = ms => { const t = performance.now(); while (performance.now() - t < ms); };
+
+      window.cocoSsd = {
+        load: async () => ({
+          detect: async (video, maxBoxes, minScore) => {
+            window.__bench.detects++;
+            spin(SYNC_MS);
+            await new Promise(r => setTimeout(r, ASYNC_MS));
+            const out = [{ class: 'person', score: 0.93, bbox: [20, 20, 120, 300] },
+                         { class: 'chair',  score: 0.55, bbox: [400, 200, 120, 160] }];
+            for (let i = 0; i < NPLANT; i++) {
+              // small deterministic jitter so the tracker and box smoothing are exercised
+              const j = Math.sin(window.__bench.detects * 0.7 + i) * 4;
+              out.push({ class: 'potted plant', score: 0.72 + 0.05 * Math.sin(i + window.__bench.detects * 0.3),
+                         bbox: [150 + i * 200 + j, 120 + j, 160, 220] });
+            }
+            return out;
+          }
+        })
+      };
+
+      window.tflite = {
+        setWasmPath() {},
+        loadTFLiteModel: async () => ({
+          predict: (input) => { window.__bench.model2++; spin(8);
+            return window.tf.tidy(() => window.tf.tensor2d([[0.05, 0.80, 0.10, 0.05]])); }
+        })
+      };
+    })();
+    </script>
     <!-- Application Script -->
-    <script src="script.js"></script>
+    <script src="/script.js"></script>
 </body>
 </html>

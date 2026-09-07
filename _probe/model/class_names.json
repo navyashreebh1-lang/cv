@@ -1,0 +1,13 @@
+{
+  "class_names": ["Tomato___healthy","Tomato___Early_blight","Potato___healthy","Potato___Late_blight"],
+  "crops": ["Tomato","Potato"],
+  "crop_display_names": {"Tomato":"Tomato","Potato":"Potato"},
+  "input": {"width": 224, "height": 224, "range": "0-255"},
+  "confidence": {"crop_min": 0.60, "condition_min": 0.55, "health_min": 0.60, "margin_min": 0.10},
+  "class_meta": [
+    {"crop":"Tomato","healthy":true,"condition_display":"Healthy"},
+    {"crop":"Tomato","healthy":false,"condition_display":"Early blight"},
+    {"crop":"Potato","healthy":true,"condition_display":"Healthy"},
+    {"crop":"Potato","healthy":false,"condition_display":"Late blight"}
+  ]
+}

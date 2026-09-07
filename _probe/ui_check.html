@@ -1,0 +1,158 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>ui check</title></head><body>
+<pre id="log">starting…</pre><div id="stage"></div>
+<script>
+// Mounts the real app in an iframe of an exact viewport width (an iframe is its
+// own viewport, so media queries evaluate against the iframe - Chrome on Windows
+// refuses to size a real window below ~500px). Drives the stubbed detector
+// through each scenario and reads back what the USER would see.
+const WIDTH  = +(new URLSearchParams(location.search).get('w') || 390);
+const HEIGHT = +(new URLSearchParams(location.search).get('h') || 844);
+const LABEL  = new URLSearchParams(location.search).get('label') || (WIDTH + 'px');
+const log = m => { document.getElementById('log').textContent += '\n' + m; };
+
+const SCENARIOS = [
+  ['empty',        0, 'no plant'],
+  ['personOnly',   0, 'person only -> must NOT be counted'],
+  ['objectsOnly',  0, 'person + chair + laptop -> 0'],
+  ['onePlant',     1, '1 plant'],
+  ['personPlant',  1, 'person + plant -> person must not suppress the plant'],
+  ['twoPlants',    2, '2 plants'],
+  ['threePlants',  3, '3 plants'],
+  ['plantAndVase', 1, 'plant + its vase -> still 1'],
+];
+
+(async () => {
+  const f = document.createElement('iframe');
+  f.width = WIDTH; f.height = HEIGHT; f.style.border = '0';
+  f.src = '/_probe/ui_app.html';
+  document.getElementById('stage').appendChild(f);
+  await new Promise(r => f.onload = r);
+  const W = f.contentWindow, D = f.contentDocument;
+  const txt = sel => { const e = D.querySelector(sel); return e ? e.textContent.trim().replace(/\s+/g, ' ') : null; };
+
+  // wait for both models to finish loading
+  const t0 = performance.now();
+  while (!(W.AGRIVISION && W.AGRIVISION.ui.state.modelReady) && performance.now() - t0 < 60000) {
+    await new Promise(r => setTimeout(r, 200));
+  }
+  if (!(W.AGRIVISION && W.AGRIVISION.ui.state.modelReady)) throw new Error('model never became ready');
+
+  const out = { label: LABEL, width: WIDTH, height: HEIGHT, scenarios: [], layout: {}, removed: {} };
+
+  // ---- what the user must NOT see ----------------------------------------
+  const bodyText = D.body.innerText.replace(/\s+/g, ' ');
+  const banned = ['RAW DETECTIONS', 'PLANT CANDIDATES', 'CONFIRMED PLANTS', 'INFERENCE TIME',
+                  'INFERENCE FPS', 'CAMERA FPS', 'SYSTEM STATUS', 'AI ENGINE', 'ENGINE',
+                  'COCO-SSD', 'AVERAGE CONFIDENCE', 'HIGHEST CONFIDENCE', 'SIMULATION',
+                  'DETECTIONS', 'STAGE 1 PROTOTYPE'];
+  out.removed.stillVisible = banned.filter(b => bodyText.toUpperCase().includes(b));
+  out.removed.debugOverlayEl = !!D.getElementById('debugOverlay');
+  out.removed.statsRowEl = !!D.querySelector('.stats-row');
+  out.removed.systemPanelEl = !!D.querySelector('.panel--system');
+
+  // ---- start camera + detection ------------------------------------------
+  D.getElementById('startCameraBtn').click();
+  await new Promise(r => setTimeout(r, 2500));
+  D.getElementById('startDetectionBtn').click();
+  await new Promise(r => setTimeout(r, 1200));
+
+  // ---- detection scenarios ------------------------------------------------
+  for (const [name, expected, why] of SCENARIOS) {
+    W.__scenario = name;
+    W.__health = name === 'twoPlants' ? 'unhealthy' : (name === 'threePlants' ? 'uncertain' : 'healthy');
+    // let the temporal tracker settle: drop old tracks, then confirm new ones
+    await new Promise(r => setTimeout(r, 2200));
+    out.scenarios.push({
+      scenario: name, why, expected,
+      count: +txt('#plantCountValue'),
+      status: txt('.indicator-text'),
+      confidence: txt('#confidenceValue'),
+      health: txt('#plantHealth'),
+      popupShown: !D.getElementById('noPlantPopup').hidden,
+      pass: +txt('#plantCountValue') === expected
+    });
+  }
+
+  // ---- layout -------------------------------------------------------------
+  W.__scenario = 'onePlant'; W.__health = 'healthy';
+  await new Promise(r => setTimeout(r, 2200));
+  const rect = sel => { const e = D.querySelector(sel); if (!e) return null;
+    const r = e.getBoundingClientRect(); return { top: Math.round(r.top), bottom: Math.round(r.bottom),
+      w: Math.round(r.width), h: Math.round(r.height) }; };
+  out.layout = {
+    horizontalOverflow: D.documentElement.scrollWidth > WIDTH + 1,
+    scrollWidth: D.documentElement.scrollWidth,
+    pageHeight: D.documentElement.scrollHeight,
+    header: rect('.header'), camera: rect('.camera-wrapper'), controls: rect('.camera-controls'),
+    detection: rect('.panel--detection'), health: rect('.panel--health'),
+    buttons: [...D.querySelectorAll('.btn')].map(b => ({
+      label: b.textContent.trim().replace(/\s+/g, ' '),
+      h: Math.round(b.getBoundingClientRect().height),
+      w: Math.round(b.getBoundingClientRect().width) })),
+    detectionAboveFold: rect('.panel--detection').bottom <= HEIGHT,
+    healthAboveFold: rect('.panel--health').bottom <= HEIGHT,
+    pageFitsViewport: D.documentElement.scrollHeight <= HEIGHT,
+
+    // Clipped text: any element whose content overflows its own box. Checks the
+    // labels and values the user must actually be able to read.
+    clipped: ['.logo', '.mode-badge', '.panel-title', '.indicator-text', '.summary-label',
+              '.summary-value', '.health-key', '.health-val', '.health-note', '.btn-text']
+      .flatMap(sel => [...D.querySelectorAll(sel)]
+        .filter(e => e.scrollWidth > e.clientWidth + 1 || e.scrollHeight > e.clientHeight + 1)
+        // Overflowing its own content box only CLIPS the text if the element or
+        // an ancestor actually establishes a clipping context. A glyph whose ink
+        // extends a couple of px past a line-height:1 box is not clipped - it is
+        // simply drawn, and stays fully readable.
+        .filter(e => {
+          // Find the nearest ancestor that actually establishes a clipping box,
+          // then ask whether this element's painted rect fits inside it. A glyph
+          // whose ink runs a couple of px past a line-height:1 content box is
+          // NOT clipped unless something downstream actually cuts it off.
+          for (let n = e.parentElement; n && n !== D.body; n = n.parentElement) {
+            const ov = W.getComputedStyle(n);
+            if (!/hidden|clip|auto|scroll/.test(ov.overflowY + ov.overflowX)) continue;
+            const er = e.getBoundingClientRect(), nr = n.getBoundingClientRect();
+            return er.top < nr.top - 1 || er.bottom > nr.bottom + 1 ||
+                   er.left < nr.left - 1 || er.right > nr.right + 1;
+          }
+          return false;
+        })
+        .map(e => sel + ' "' + e.textContent.trim().slice(0, 24) + '" ' +
+                  e.scrollWidth + 'x' + e.scrollHeight + ' in ' + e.clientWidth + 'x' + e.clientHeight)),
+
+    // Duplicated button labels: one visible text node per button, and no
+    // ::before/::after copy of it.
+    dupLabels: [...D.querySelectorAll('.btn')].map(b => {
+      // Count LABEL spans only - .btn-icon is a legitimate second span holding
+      // the glyph, not a duplicate of the text.
+      const spans = [...b.querySelectorAll('span')]
+        .filter(sp => sp.textContent.trim() && !sp.classList.contains('btn-icon') &&
+                      W.getComputedStyle(sp).display !== 'none');
+      const pseudo = ['::before', '::after'].flatMap(pp =>
+        [b, ...b.querySelectorAll('span')].map(el => W.getComputedStyle(el, pp).content)
+          .filter(c => c && c !== 'none' && c !== 'normal' && c !== '\"\"'));
+      const words = b.textContent.trim().replace(/\s+/g, ' ');
+      const repeated = /(\w+)[\s\S]*/i.test(words.replace(/[^\w\s]/g, ''));
+      return { label: words, textSpans: spans.length, pseudoContent: pseudo, repeatedWord: repeated };
+    }).filter(b => b.textSpans > 1 || b.pseudoContent.length || b.repeatedWord)
+  };
+
+  // ---- Model 2 absent / failed --------------------------------------------
+  // The two states where the module must refuse to invent a verdict. Driven by
+  // PlantAnalyzer's own status flags, then restored.
+  const A = W.AGRIVISION.analyzer, ui = W.AGRIVISION.ui;
+  const force = () => { ui.lastUi.healthSig = null; ui.updateDetectionUI(); };
+  const savedAvail = A.available, savedStatus = A.status;
+  A.available = false; A.status = 'absent'; force();
+  out.healthStates = { notInstalled: txt('#plantHealth') };
+  A.status = 'error'; force();
+  out.healthStates.loadFailed = txt('#plantHealth');
+  A.available = savedAvail; A.status = savedStatus; force();
+  out.healthStates.restored = txt('#plantHealth');
+
+  log(JSON.stringify(out, null, 1));
+  await fetch('/result', { method: 'POST', body: JSON.stringify(out) });
+  log('POSTED');
+})().catch(e => { log('ERROR ' + e.message);
+  fetch('/result', { method: 'POST', body: JSON.stringify({ error: e.message, stack: String(e.stack) }) }); });
+</script></body></html>

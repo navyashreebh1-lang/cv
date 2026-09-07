@@ -1,0 +1,74 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>measure</title></head><body>
+<pre id="log">…</pre><div id="stage"></div>
+<script>
+// Vertical-space audit at one exact viewport. Reports every block's box plus the
+// gap above it, so trimming can be aimed at whatever is actually costing height.
+const q = new URLSearchParams(location.search);
+const W = +(q.get('w') || 375), H = +(q.get('h') || 667);
+const log = m => { document.getElementById('log').textContent += '\n' + m; };
+
+(async () => {
+  const f = document.createElement('iframe');
+  f.width = W; f.height = H; f.style.border = '0'; f.src = '/_probe/ui_app.html';
+  document.getElementById('stage').appendChild(f);
+  await new Promise(r => f.onload = r);
+  const win = f.contentWindow, doc = f.contentDocument;
+  const t0 = performance.now();
+  while (!(win.AGRIVISION && win.AGRIVISION.ui.state.modelReady) && performance.now() - t0 < 60000)
+    await new Promise(r => setTimeout(r, 200));
+
+  doc.getElementById('startCameraBtn').click();
+  await new Promise(r => setTimeout(r, 2500));
+  doc.getElementById('startDetectionBtn').click();
+  win.__scenario = 'onePlant'; win.__health = 'healthy';
+  await new Promise(r => setTimeout(r, 2500));
+
+  const cs = (el, ...props) => { const s = win.getComputedStyle(el);
+    return props.map(p => p + '=' + s[p]).join(' '); };
+  const box = el => { const r = el.getBoundingClientRect();
+    return { top: +r.top.toFixed(1), bottom: +r.bottom.toFixed(1), h: +r.height.toFixed(1) }; };
+
+  const blocks = [
+    ['header', '.header'], ['camera', '.camera-wrapper'], ['controls', '.camera-controls'],
+    ['detectionPanel', '.panel--detection'], ['flowArrow', '.flow-arrow'],
+    ['healthPanel', '.panel--health']
+  ];
+  const out = { viewport: W + 'x' + H, blocks: [], parts: {}, styles: {} };
+  let prevBottom = 0;
+  for (const [name, sel] of blocks) {
+    const el = doc.querySelector(sel);
+    if (!el) { out.blocks.push({ name, missing: true }); continue; }
+    const b = box(el);
+    out.blocks.push({ name, ...b, gapAbove: +(b.top - prevBottom).toFixed(1) });
+    prevBottom = b.bottom;
+  }
+  out.overshoot = +(prevBottom - H).toFixed(1);
+
+  // inside the two panels
+  for (const [k, sel] of [['panelHeaderDet', '.panel--detection .panel-header'],
+                          ['statusPill', '.summary-indicator'],
+                          ['countRow', '.summary-stat--headline'],
+                          ['confRow', '.detection-summary .summary-stat:last-child'],
+                          ['panelHeaderHealth', '.panel--health .panel-header'],
+                          ['healthBody', '.health-body']]) {
+    const el = doc.querySelector(sel); if (el) out.parts[k] = box(el);
+  }
+  const healthRows = [...doc.querySelectorAll('.health-row')].map(e => box(e).h);
+  out.parts.healthRowHeights = healthRows;
+
+  out.styles.container = cs(doc.querySelector('.container'), 'gap', 'paddingTop', 'paddingBottom');
+  out.styles.panel = cs(doc.querySelector('.panel'), 'paddingTop', 'paddingBottom');
+  out.styles.btn = cs(doc.querySelector('.btn'), 'minHeight', 'fontSize');
+  out.styles.camera = cs(doc.querySelector('.camera-wrapper'), 'height', 'maxHeight', 'aspectRatio');
+  out.styles.controls = cs(doc.querySelector('.camera-controls'), 'gap');
+  out.styles.summary = cs(doc.querySelector('.detection-summary'), 'gap');
+  out.styles.panelTitle = cs(doc.querySelector('.panel-title'), 'fontSize');
+  out.styles.countValue = cs(doc.querySelector('.summary-stat--headline .summary-value'), 'fontSize');
+  out.pageHeight = doc.documentElement.scrollHeight;
+
+  log(JSON.stringify(out, null, 1));
+  await fetch('/result', { method: 'POST', body: JSON.stringify(out) });
+  log('POSTED');
+})().catch(e => { log('ERR ' + e.message);
+  fetch('/result', { method: 'POST', body: JSON.stringify({ error: e.message }) }); });
+</script></body></html>
