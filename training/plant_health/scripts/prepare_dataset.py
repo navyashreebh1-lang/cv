@@ -2,9 +2,11 @@
 AGRIVISION Model 2 - dataset preparation.
 
     python scripts/prepare_dataset.py [--skip-download] [--max-per-class N]
+                                      [--pv-source auto|github|tfds]
 
 Pipeline:
-  1. Materialise PlantVillage (via TFDS, no Kaggle auth needed) to class folders.
+  1. Materialise PlantVillage to class folders, from the authors' GitHub mirror
+     (no Kaggle account, API token or login needed). TFDS is kept as a fallback.
   2. Fetch PlantDoc (field photos) as an OUT-OF-DOMAIN test set. Never trained on.
   3. Drop corrupt / tiny / greyscale-degenerate images.
   4. Cluster near-duplicates with a difference hash and assign whole clusters to
@@ -45,17 +47,96 @@ DHASH_SIZE = 8          # 64-bit difference hash
 
 
 # ---------------------------------------------------------------------------
-# 1. PlantVillage via TFDS
+# 1. PlantVillage
 # ---------------------------------------------------------------------------
-def download_plantvillage(out_dir: Path) -> None:
-    """TFDS 'plant_village': 54,303 images / 38 classes, no auth required."""
-    if out_dir.exists() and any(out_dir.iterdir()):
-        print(f"[prepare] PlantVillage already materialised at {out_dir}, skipping.")
-        return
+# ACQUISITION ONLY. Everything downstream of this function - cleaning,
+# de-duplication, class pruning, cluster-based splitting, the OOD set - is
+# unchanged and still reads `raw/plantvillage/<Crop___Condition>/*.jpg`.
+#
+# Why this is not just `tfds.load("plant_village")` any more: TFDS fetches the
+# archive from data.mendeley.com, which now answers programmatic requests with
+# **HTTP 403**, so the TFDS route fails before a single image is written. The
+# GitHub mirror below is the dataset as published by the PlantVillage authors
+# (Mohanty et al., the spMohanty/PlantVillage-Dataset repo), needs no account,
+# no API token and no login, and its `raw/color/` folders are named with the
+# same `Crop___Condition` convention this pipeline already expects - so nothing
+# downstream has to change.
+#
+# TFDS is kept as a fallback rather than deleted: if Mendeley starts answering
+# again, or the machine already has a TFDS cache, that path still works.
+PLANTVILLAGE_REPO = "https://github.com/spMohanty/PlantVillage-Dataset.git"
+PLANTVILLAGE_BRANCH = "master"
+PLANTVILLAGE_SUBDIR = "raw/color"     # color images; grayscale/ and segmented/ are not fetched
 
+# A complete copy is 38 class folders / ~54k images. Anything far below that is
+# a half-finished download, not a dataset.
+MIN_CLASSES_EXPECTED = 30
+MIN_IMAGES_EXPECTED = 20000
+
+
+def _survey(out_dir: Path) -> tuple[int, int]:
+    """(class folders, image files) currently in out_dir."""
+    if not out_dir.exists():
+        return 0, 0
+    class_dirs = [p for p in out_dir.iterdir() if p.is_dir()]
+    images = sum(1 for d in class_dirs for f in d.iterdir()
+                 if f.suffix.lower() in (".jpg", ".jpeg", ".png"))
+    return len(class_dirs), images
+
+
+def _run(cmd: list[str]) -> None:
+    subprocess.run(cmd, check=True)
+
+
+def _download_plantvillage_github(out_dir: Path) -> None:
+    """Sparse-clone just raw/color, then move it into place.
+
+    The clone lands in a temporary directory and is only moved to its final
+    name once git has finished. That is what makes re-running safe: an
+    interrupted download can never leave something that looks like a complete
+    dataset, and the next run simply starts again from a clean slate.
+    """
+    tmp_repo = out_dir.parent / "_plantvillage_clone"
+    if tmp_repo.exists():
+        print(f"[prepare] Removing leftover partial clone at {tmp_repo}")
+        shutil.rmtree(tmp_repo, ignore_errors=True)
+
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # Partial clone + sparse checkout: fetch blobs only for raw/color, so the
+    # grayscale and segmented copies of the same 54k images are never
+    # transferred. Falls back to a plain shallow clone on an older git.
+    try:
+        print(f"[prepare] Cloning PlantVillage from {PLANTVILLAGE_REPO}")
+        print(f"[prepare]   (sparse: {PLANTVILLAGE_SUBDIR} only - this takes a few minutes)")
+        _run(["git", "clone", "--filter=blob:none", "--no-checkout", "--depth", "1",
+              "--branch", PLANTVILLAGE_BRANCH, PLANTVILLAGE_REPO, str(tmp_repo)])
+        _run(["git", "-C", str(tmp_repo), "sparse-checkout", "init", "--cone"])
+        _run(["git", "-C", str(tmp_repo), "sparse-checkout", "set", PLANTVILLAGE_SUBDIR])
+        _run(["git", "-C", str(tmp_repo), "checkout", PLANTVILLAGE_BRANCH])
+    except subprocess.CalledProcessError as exc:
+        print(f"[prepare] Sparse clone unavailable ({exc}); retrying as a full shallow clone.")
+        shutil.rmtree(tmp_repo, ignore_errors=True)
+        _run(["git", "clone", "--depth", "1", "--branch", PLANTVILLAGE_BRANCH,
+              PLANTVILLAGE_REPO, str(tmp_repo)])
+
+    src = tmp_repo / PLANTVILLAGE_SUBDIR
+    if not src.is_dir():
+        raise RuntimeError(f"{PLANTVILLAGE_SUBDIR} not found in the clone at {tmp_repo}")
+
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    # Same filesystem, so this is a rename, not a 54k-file copy.
+    shutil.move(str(src), str(out_dir))
+    shutil.rmtree(tmp_repo, ignore_errors=True)
+
+
+def _download_plantvillage_tfds(out_dir: Path) -> None:
+    """Original route. Broken while data.mendeley.com returns 403, kept because
+    it works from a warm TFDS cache and may start working again."""
     import tensorflow_datasets as tfds
 
-    print("[prepare] Downloading PlantVillage via TFDS (~2GB, one time)...")
+    print("[prepare] Trying TFDS 'plant_village'...")
     ds, info = tfds.load("plant_village", split="train", with_info=True,
                          as_supervised=False, shuffle_files=False)
     names = info.features["label"].names
@@ -72,6 +153,50 @@ def download_plantvillage(out_dir: Path) -> None:
         Image.fromarray(rec["image"]).save(cls_dir / f"{label}_{idx:05d}.jpg",
                                            quality=95)
     print(f"[prepare] Wrote {sum(counters.values())} images to {out_dir}")
+
+
+def download_plantvillage(out_dir: Path, source: str = "auto") -> None:
+    """Materialise PlantVillage as raw/plantvillage/<Crop___Condition>/*.
+
+    Idempotent: an existing complete copy is detected and left alone, so
+    re-running prepare_dataset.py after a crash does not re-download 54k images.
+    """
+    n_classes, n_images = _survey(out_dir)
+    if n_classes >= MIN_CLASSES_EXPECTED and n_images >= MIN_IMAGES_EXPECTED:
+        print(f"[prepare] PlantVillage already present at {out_dir} "
+              f"({n_classes} classes, {n_images:,} images) - skipping download.")
+        return
+    if n_classes or n_images:
+        print(f"[prepare] Found an INCOMPLETE PlantVillage at {out_dir} "
+              f"({n_classes} classes, {n_images:,} images); re-fetching.")
+
+    routes = {"auto": ["github", "tfds"], "github": ["github"], "tfds": ["tfds"]}[source]
+    errors = []
+    for route in routes:
+        try:
+            if route == "github":
+                _download_plantvillage_github(out_dir)
+            else:
+                _download_plantvillage_tfds(out_dir)
+        except Exception as exc:                      # noqa: BLE001 - try the next route
+            errors.append(f"{route}: {type(exc).__name__}: {exc}")
+            print(f"[prepare] Source '{route}' failed -> {type(exc).__name__}: {exc}")
+            continue
+
+        n_classes, n_images = _survey(out_dir)
+        print(f"[prepare] PlantVillage ready via {route}: "
+              f"{n_classes} class folders, {n_images:,} images at {out_dir}")
+        if n_classes < MIN_CLASSES_EXPECTED or n_images < MIN_IMAGES_EXPECTED:
+            errors.append(f"{route}: only {n_classes} classes / {n_images} images")
+            print("[prepare] ...that is short of a complete copy; trying the next source.")
+            continue
+        return
+
+    raise RuntimeError(
+        "Could not obtain PlantVillage from any source.\n  " + "\n  ".join(errors) +
+        f"\n\nManual fallback: place the class folders yourself as\n"
+        f"  {out_dir}/<Crop___Condition>/*.jpg\n"
+        f"then re-run with --skip-download.")
 
 
 # ---------------------------------------------------------------------------
@@ -266,11 +391,15 @@ def main() -> None:
     ap.add_argument("--skip-download", action="store_true")
     ap.add_argument("--max-per-class", type=int, default=None,
                     help="cap images per class (useful for a fast smoke run)")
+    ap.add_argument("--pv-source", choices=("auto", "github", "tfds"), default="auto",
+                    help="where PlantVillage comes from. 'auto' tries the GitHub "
+                         "mirror then TFDS; 'tfds' forces the old Mendeley route, "
+                         "which currently returns HTTP 403.")
     args = ap.parse_args()
 
     pv_dir = C.RAW_DIR / "plantvillage"
     if not args.skip_download:
-        download_plantvillage(pv_dir)
+        download_plantvillage(pv_dir, source=args.pv_source)
 
     print("[prepare] Cleaning, de-duplicating and splitting...")
     report = prepare(pv_dir, C.WORK_DIR, args.max_per_class)

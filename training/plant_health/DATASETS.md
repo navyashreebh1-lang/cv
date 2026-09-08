@@ -10,7 +10,7 @@ cannot support. Nothing is downloaded that is not listed here.
 | field | value |
 |---|---|
 | **Name** | PlantVillage (Hughes & Salathé, 2015) |
-| **Source** | [TFDS `plant_village`](https://www.tensorflow.org/datasets/catalog/plant_village) · [Kaggle mirror](https://www.kaggle.com/datasets/mohitsingh1804/plantvillage) · [IEEE DataPort](https://ieee-dataport.org/documents/plantvillage-plant-disease-classification-dataset) |
+| **Source** | **Used:** [github.com/spMohanty/PlantVillage-Dataset](https://github.com/spMohanty/PlantVillage-Dataset) `raw/color/` (the authors' own release) · *fallback:* [TFDS `plant_village`](https://www.tensorflow.org/datasets/catalog/plant_village) · [Kaggle mirror](https://www.kaggle.com/datasets/mohitsingh1804/plantvillage) |
 | **Images** | 54,303 (256×256 RGB, single detached leaf) |
 | **Classes** | 38, named `Crop___Condition` |
 | **Crops** | apple, blueberry, cherry, corn (maize), grape, orange, peach, bell pepper, potato, raspberry, soybean, squash, strawberry, tomato — 14 total |
@@ -18,7 +18,8 @@ cannot support. Nothing is downloaded that is not listed here.
 | **Disease classes** | 26 |
 | **License** | Public domain / CC0 as distributed; redistributed through TFDS |
 | **Permitted use** | Research, education, commercial — no restriction asserted by the distributors |
-| **How we use it** | Train / validation / in-domain test. Accessed via TFDS so no Kaggle credentials are needed. |
+| **How we use it** | Train / validation / in-domain test. Fetched by a sparse `git clone` of the authors' GitHub repo - no Kaggle account, API token or login. |
+| **Why not TFDS** | TFDS downloads the archive from `data.mendeley.com`, which now answers programmatic requests with **HTTP 403**, so `tfds.load("plant_village")` fails outright. `prepare_dataset.py --pv-source tfds` still forces that route if it ever starts working again. |
 
 ### The critical limitation
 
