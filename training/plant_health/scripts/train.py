@@ -35,7 +35,15 @@ def build_datasets():
         return tf.keras.utils.image_dataset_from_directory(
             C.WORK_DIR / split,
             labels="inferred",
-            label_mode="int",
+            # One-hot, not integer, labels. Keras 3 removed `label_smoothing`
+            # from SparseCategoricalCrossentropy - and could not sensibly have
+            # kept it, because smoothing spreads epsilon mass across the whole
+            # label vector and a bare class index has no vector to spread it
+            # over. CategoricalCrossentropy does support it and needs one-hot
+            # targets, so the conversion happens here, at load time.
+            # `class_weight` is unaffected: Keras maps one-hot targets back to
+            # class ids with argmax before applying the weights.
+            label_mode="categorical",
             image_size=(C.IMG_SIZE, C.IMG_SIZE),
             batch_size=C.BATCH_SIZE,
             shuffle=shuffle,
@@ -198,13 +206,22 @@ def main() -> None:
 
     model, base = build_model(num_classes)
 
+    # Metrics follow the label format chosen in build_datasets() - one-hot,
+    # so the non-sparse variants. The reported NAMES are unchanged
+    # ("acc" / "top3"), so history.csv and every callback monitor still work.
     metrics = [
-        tf.keras.metrics.SparseCategoricalAccuracy(name="acc"),
-        tf.keras.metrics.SparseTopKCategoricalAccuracy(k=3, name="top3"),
+        tf.keras.metrics.CategoricalAccuracy(name="acc"),
+        tf.keras.metrics.TopKCategoricalAccuracy(k=3, name="top3"),
     ]
-    loss = tf.keras.losses.SparseCategoricalCrossentropy(
+    # LABEL_SMOOTHING (0.05) is preserved exactly; only the class carrying it
+    # changed. Both of these are BUILT-IN Keras losses, which matters more
+    # than it looks: the compiled loss is serialised into best_model.keras,
+    # and evaluate.py / export_tflite.py both call load_model() with no
+    # custom_objects. A hand-written smoothing loss would train fine and then
+    # fail to load afterwards - a worse bug than the one being fixed.
+    loss = tf.keras.losses.CategoricalCrossentropy(
         label_smoothing=C.LABEL_SMOOTHING) if C.LABEL_SMOOTHING else \
-        tf.keras.losses.SparseCategoricalCrossentropy()
+        tf.keras.losses.CategoricalCrossentropy()
 
     best_path = C.MODELS_DIR / "best_model.keras"
     callbacks = [

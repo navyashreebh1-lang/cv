@@ -87,6 +87,40 @@ if built:
           probs.shape == (4, 34) and np.allclose(probs.sum(axis=1), 1.0, atol=1e-4),
           f"shape {probs.shape}, row sums {np.round(probs.sum(axis=1), 5).tolist()}")
 
+# ---- 5. loss + metrics construct and run ---------------------------------
+# Keras 3 dropped `label_smoothing` from SparseCategoricalCrossentropy, so the
+# pipeline uses one-hot labels with CategoricalCrossentropy instead. Check the
+# loss actually builds, returns a finite number, and that smoothing is really
+# switched on - a silent fallback to no smoothing would still "work".
+print("\n5. loss (Keras 3 label smoothing)")
+num_classes = 34
+loss_fn = tf.keras.losses.CategoricalCrossentropy(label_smoothing=C.LABEL_SMOOTHING)
+
+y_idx = np.array([0, 5, 17, 33])
+y_true = tf.one_hot(y_idx, num_classes)
+logits = tf.random.stateless_normal((4, num_classes), seed=(C.SEED, 2))
+y_pred = tf.nn.softmax(logits)
+
+value = float(loss_fn(y_true, y_pred).numpy())
+check("loss constructs and returns a finite scalar", np.isfinite(value), f"loss={value:.5f}")
+
+plain = float(tf.keras.losses.CategoricalCrossentropy()(y_true, y_pred).numpy())
+check("label smoothing is actually applied", abs(value - plain) > 1e-6,
+      f"smoothed {value:.5f} vs unsmoothed {plain:.5f} (eps={C.LABEL_SMOOTHING})")
+
+acc = tf.keras.metrics.CategoricalAccuracy(name="acc")
+top3 = tf.keras.metrics.TopKCategoricalAccuracy(k=3, name="top3")
+acc.update_state(y_true, y_pred)
+top3.update_state(y_true, y_pred)
+check("one-hot metrics update", np.isfinite(float(acc.result())) and
+      np.isfinite(float(top3.result())),
+      f"acc={float(acc.result()):.3f} top3={float(top3.result()):.3f}")
+
+# class_weight is passed to fit() with these one-hot targets; Keras recovers the
+# class id by argmax, so the weighting is unchanged by the label-format switch.
+check("one-hot -> class id via argmax (class_weight path)",
+      bool(np.array_equal(np.argmax(y_true.numpy(), axis=1), y_idx)))
+
 print()
 if failures:
     print(f"FAILED: {len(failures)} check(s) -> {failures}")
