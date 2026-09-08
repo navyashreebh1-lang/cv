@@ -245,15 +245,70 @@ def download_plantdoc(raw_dir: Path) -> Path:
     return repo_dir
 
 
-def build_ood_set(repo_dir: Path, out_dir: Path, keep_labels: set) -> dict:
-    """Copy the mappable PlantDoc images into ood/<plantvillage_label>/."""
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def assign_field_split(cluster_key: str) -> str:
+    """Deterministic train/val bucket for a PlantDoc duplicate cluster.
 
-    stats = {"copied": 0, "unmapped_dirs": [], "dropped_not_in_label_space": 0}
-    for split in ("train", "test"):          # OOD set: we use all of PlantDoc
-        split_dir = repo_dir / split
+    Salted differently from assign_split() so a cluster's field assignment is
+    not correlated with the PlantVillage bucketing, and driven only by the
+    image content hash - so it does not depend on file order, on how many
+    images exist, or on the run.
+    """
+    h = int(hashlib.sha256(("field:" + cluster_key).encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+    acc = 0.0
+    for split in ("train", "val"):
+        acc += C.FIELD_SPLIT_FRACTIONS[split]
+        if h < acc:
+            return split
+    return "val"
+
+
+def build_field_splits(repo_dir: Path, field_dir: Path, keep_labels: set,
+                       pv_hashes: set) -> dict:
+    """Turn PlantDoc into field/{train,val,test}/<plantvillage_label>/.
+
+    PlantDoc's OWN published test split becomes field/test and is never trained
+    on; its train split is divided into field/train and field/val.
+
+    Leakage rules, in order of precedence:
+
+      1. Clusters are built from the 64-bit dHash over the WHOLE PlantDoc
+         corpus, so a cluster can span the published train and test splits.
+      2. TEST WINS. If a cluster contains any test-split image, every
+         train-split image in that cluster is DROPPED rather than moved. That
+         removes the leak while leaving the published test set exactly as
+         published - moving images into it would quietly redefine the
+         benchmark.
+      3. field/test keeps every published test image, duplicates included. It
+         is the benchmark; collapsing duplicates inside it would make results
+         non-comparable with published PlantDoc numbers. Any duplicates found
+         are reported, not silently removed.
+      4. Remaining (train-only) clusters are assigned whole to train or val, so
+         a near-duplicate pair can never straddle them, and only ONE image per
+         cluster is kept for training.
+      5. Any PlantDoc image whose hash also appears in PlantVillage is dropped.
+         Overlap is unlikely between lab and web imagery, but it would be a
+         leak straight into the PlantVillage test split, and the check is free
+         once both hash sets exist.
+    """
+    if field_dir.exists():
+        shutil.rmtree(field_dir)
+
+    stats = {
+        "per_split": {"train": 0, "val": 0, "test": 0},
+        "per_class": {},
+        "unmapped_dirs": [],
+        "dropped_not_in_label_space": 0,
+        "dropped_unusable": 0,
+        "dropped_train_leaking_into_test": 0,
+        "dropped_duplicate_within_train": 0,
+        "dropped_overlapping_plantvillage": 0,
+        "duplicate_pairs_inside_published_test": 0,
+    }
+
+    # ---- 1. collect and hash everything --------------------------------
+    records = []                      # (origin_split, pv_label, path, dhash)
+    for origin in ("train", "test"):
+        split_dir = repo_dir / origin
         if not split_dir.is_dir():
             continue
         for cls_dir in sorted(p for p in split_dir.iterdir() if p.is_dir()):
@@ -265,15 +320,75 @@ def build_ood_set(repo_dir: Path, out_dir: Path, keep_labels: set) -> dict:
             if pv_label not in keep_labels:
                 stats["dropped_not_in_label_space"] += 1
                 continue
-            dest = out_dir / pv_label
-            dest.mkdir(exist_ok=True)
-            for img in cls_dir.iterdir():
+            for img in sorted(cls_dir.iterdir()):
                 if img.suffix.lower() not in (".jpg", ".jpeg", ".png"):
                     continue
                 if not is_usable_image(img):
+                    stats["dropped_unusable"] += 1
                     continue
-                shutil.copy2(img, dest / f"{split}_{img.name}")
-                stats["copied"] += 1
+                try:
+                    h = dhash(img)
+                except Exception:
+                    stats["dropped_unusable"] += 1
+                    continue
+                records.append((origin, pv_label, img, h))
+
+    # ---- 2. cluster by hash, across BOTH published splits ---------------
+    clusters = defaultdict(list)
+    for rec in records:
+        clusters[rec[3]].append(rec)
+
+    test_hashes = {h for origin, _, _, h in records if origin == "test"}
+
+    to_copy = []                      # (split, pv_label, path)
+    for h, group in clusters.items():
+        in_test = [r for r in group if r[0] == "test"]
+        in_train = [r for r in group if r[0] == "train"]
+
+        if in_test:
+            # Rule 3: publish the test images as they are.
+            if len(in_test) > 1:
+                stats["duplicate_pairs_inside_published_test"] += len(in_test) - 1
+            for _, pv_label, img, _ in in_test:
+                to_copy.append(("test", pv_label, img))
+            # Rule 2: everything on the train side of this cluster is dropped.
+            stats["dropped_train_leaking_into_test"] += len(in_train)
+            continue
+
+        # Rule 5: overlap with the lab dataset.
+        if h in pv_hashes:
+            stats["dropped_overlapping_plantvillage"] += len(in_train)
+            continue
+
+        # Rule 4: one image per cluster, whole cluster to one split.
+        split = assign_field_split(h)
+        keep = sorted(in_train, key=lambda r: str(r[2]))[0]
+        stats["dropped_duplicate_within_train"] += len(in_train) - 1
+        to_copy.append((split, keep[1], keep[2]))
+
+    # ---- 3. materialise --------------------------------------------------
+    for split, pv_label, img in to_copy:
+        dest = field_dir / split / pv_label
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(img, dest / img.name)
+        stats["per_split"][split] += 1
+        stats["per_class"].setdefault(pv_label, {"train": 0, "val": 0, "test": 0})
+        stats["per_class"][pv_label][split] += 1
+
+    # ---- 4. assert the guarantee rather than assume it -------------------
+    # Cheap, and it is the whole point of the exercise: no hash may appear in
+    # more than one field split.
+    seen = {}
+    for split, _, img in to_copy:
+        h = dhash(img)
+        if h in seen and seen[h] != split:
+            raise RuntimeError(
+                f"LEAK: hash {h} appears in both '{seen[h]}' and '{split}' "
+                f"({img}). Refusing to write a contaminated split.")
+        seen[h] = split
+    stats["verified_no_cross_split_hash"] = True
+    stats["published_test_images_kept"] = len(test_hashes)
+
     return stats
 
 
@@ -321,7 +436,8 @@ def assign_split(cluster_key: str) -> str:
     return "test"
 
 
-def prepare(src_dir: Path, work_dir: Path, max_per_class: int | None) -> dict:
+def prepare(src_dir: Path, work_dir: Path,
+            max_per_class: int | None) -> tuple[dict, set]:
     if work_dir.exists():
         shutil.rmtree(work_dir)
     for s in C.SPLITS:
@@ -335,6 +451,11 @@ def prepare(src_dir: Path, work_dir: Path, max_per_class: int | None) -> dict:
 
     class_dirs = sorted(p for p in src_dir.iterdir() if p.is_dir())
     report["classes_seen"] = len(class_dirs)
+
+    # Every PlantVillage hash seen, so build_field_splits() can drop any
+    # PlantDoc image that duplicates a lab image. Collected here because the
+    # hashes are computed anyway; re-deriving them would re-hash ~44k files.
+    pv_hashes: set[str] = set()
 
     for cls_dir in class_dirs:
         label = cls_dir.name
@@ -356,6 +477,7 @@ def prepare(src_dir: Path, work_dir: Path, max_per_class: int | None) -> dict:
             except Exception:
                 report["corrupt_or_blank"] += 1
                 continue
+            pv_hashes.add(h)
             if h in seen_hashes:
                 # Exact-visual duplicate: keep ONE copy only. Duplicates inflate
                 # both the class count and the test score.
@@ -383,7 +505,7 @@ def prepare(src_dir: Path, work_dir: Path, max_per_class: int | None) -> dict:
         report["per_class"][label] = counts
         report["classes_kept"] += 1
 
-    return report
+    return report, pv_hashes
 
 
 def main() -> None:
@@ -402,21 +524,24 @@ def main() -> None:
         download_plantvillage(pv_dir, source=args.pv_source)
 
     print("[prepare] Cleaning, de-duplicating and splitting...")
-    report = prepare(pv_dir, C.WORK_DIR, args.max_per_class)
+    report, pv_hashes = prepare(pv_dir, C.WORK_DIR, args.max_per_class)
 
     labels = sorted(report["per_class"].keys())
     if not labels:
         sys.exit("[prepare] FATAL: no class survived pruning. Check the download.")
 
-    # OOD set, restricted to the surviving label space.
-    ood_stats = {"copied": 0, "unmapped_dirs": [], "dropped_not_in_label_space": 0}
+    # Field domain (PlantDoc), restricted to the surviving label space.
+    # Its published TRAIN split feeds field/train + field/val; its published
+    # TEST split becomes field/test and is never trained on.
+    field_stats = None
     if not args.skip_download:
         try:
             repo = download_plantdoc(C.RAW_DIR)
-            ood_stats = build_ood_set(repo, C.OOD_DIR, set(labels))
+            field_stats = build_field_splits(repo, C.FIELD_DIR, set(labels), pv_hashes)
         except Exception as exc:                     # non-fatal
-            print(f"[prepare] WARNING: PlantDoc OOD set unavailable ({exc}). "
-                  f"Evaluation will be in-domain ONLY, which overstates real-world skill.")
+            print(f"[prepare] WARNING: PlantDoc field set unavailable ({exc}). "
+                  f"Training will be lab-only and evaluation in-domain ONLY, "
+                  f"which overstates real-world skill.")
 
     healthy = sum(v for k, vs in report["per_class"].items()
                   if C.is_healthy(k) for v in vs.values())
@@ -430,9 +555,16 @@ def main() -> None:
         "healthy_images": healthy,
         "unhealthy_images": unhealthy,
         "prepare_report": report,
-        "ood": {"images": ood_stats["copied"],
-                "unmapped_plantdoc_dirs": ood_stats["unmapped_dirs"],
-                "source": "PlantDoc (CC-BY-4.0)"},
+        # Regression guard: the PlantVillage split is assigned by a pure
+        # function of each image's dhash, so this count must stay identical
+        # across runs. If it moves, the lab test set moved and no comparison
+        # with a previous run is valid.
+        "plantvillage_test_images": report["per_split"]["test"],
+        "field": ({"source": "PlantDoc (CC-BY-4.0)",
+                   "published_train_split": "-> field/train + field/val",
+                   "published_test_split": "-> field/test (never trained on)",
+                   **field_stats} if field_stats else
+                  {"source": "PlantDoc (CC-BY-4.0)", "available": False}),
     }
     C.DATASET_DIR.mkdir(parents=True, exist_ok=True)
     (C.DATASET_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -447,7 +579,35 @@ def main() -> None:
     print(f"  train/val/test      : {report['per_split']['train']} / "
           f"{report['per_split']['val']} / {report['per_split']['test']}")
     print(f"  healthy / unhealthy : {healthy} / {unhealthy}")
-    print(f"  OOD (PlantDoc)      : {ood_stats['copied']} images")
+
+    print("\n=== FIELD DOMAIN (PlantDoc) ===")
+    if not field_stats:
+        print("  NOT AVAILABLE - training will be lab-only.")
+    else:
+        f = field_stats
+        print(f"  train / val / test  : {f['per_split']['train']} / "
+              f"{f['per_split']['val']} / {f['per_split']['test']}")
+        print(f"  classes covered     : {len(f['per_class'])} of {len(labels)}")
+        print(f"  verified no hash spans two splits: "
+              f"{f['verified_no_cross_split_hash']}")
+        print("  dropped:")
+        print(f"      leaking into published test : "
+              f"{f['dropped_train_leaking_into_test']}")
+        print(f"      duplicate within field/train: "
+              f"{f['dropped_duplicate_within_train']}")
+        print(f"      also in PlantVillage        : "
+              f"{f['dropped_overlapping_plantvillage']}")
+        print(f"      unusable / unmapped label   : "
+              f"{f['dropped_unusable']} / {f['dropped_not_in_label_space']}")
+        if f["duplicate_pairs_inside_published_test"]:
+            print(f"  NOTE: {f['duplicate_pairs_inside_published_test']} duplicate(s) "
+                  f"exist INSIDE the published test set; left in place so the "
+                  f"benchmark stays as published.")
+        fh = sum(v["test"] for k, v in f["per_class"].items() if C.is_healthy(k))
+        fu = sum(v["test"] for k, v in f["per_class"].items() if not C.is_healthy(k))
+        print(f"  field/test balance  : {fh} healthy / {fu} unhealthy "
+              f"(always-unhealthy baseline = {fu / max(fh + fu, 1):.1%})")
+
     print(f"\n  manifest -> {C.DATASET_DIR / 'manifest.json'}")
 
 

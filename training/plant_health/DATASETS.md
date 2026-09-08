@@ -63,11 +63,44 @@ dataset — candidates worth evaluating are listed at the bottom of this file.
 | **Classes** | 13 plant species, up to 17 disease classes (~28 folders) |
 | **License** | **CC-BY-4.0** — attribution required |
 | **Permitted use** | Research, education and commercial, with attribution and citation |
-| **How we use it** | **Evaluation only.** Never enters training, validation or the in-domain test split. |
+| **How we use it** | **Split by its own published split.** PlantDoc's `train/` feeds our `field/train` + `field/val`; its `test/` becomes `field/test` and is **never trained on**. |
 
 Field photographs scraped from the web and hand-annotated (~300 human hours), so
 they carry the messiness the rover camera will actually see: dirt, hands,
 overlapping canopy, shadows, variable sunlight.
+
+### Why it is now a TRAINING domain (changed 2026-09-08)
+
+The first full run scored **96.12%** on the PlantVillage test split and **18.18%**
+on PlantDoc - a 78-point domain gap. Its binary health accuracy on PlantDoc
+(82.85%) was only ~4.7 points above always answering "unhealthy", because 78.2%
+of that set is unhealthy. The model had learned PlantVillage's capture
+conditions rather than the disease.
+
+A domain gap is only closed with data from that domain, so PlantDoc's published
+**train** split now contributes to training. What this costs, stated plainly:
+`field/test` is a **held-out field test**, not an unseen *domain* - the model has
+now seen other images from the same corpus. It stays a genuine generalisation
+test (those images and every near-duplicate of them are excluded from training),
+but it no longer measures transfer to a completely unseen distribution. The only
+thing that would is a set captured on the actual rover camera.
+
+**Split integrity** (enforced in `prepare_dataset.py`, verified independently by
+`scripts/check_splits.py`):
+
+| rule | handling |
+|---|---|
+| Published test split | Used as `field/test` verbatim - never re-split, never trained on |
+| Train images that duplicate a test image | **Dropped from training**, not moved, so the published benchmark is left exactly as published |
+| Duplicates inside the published test set | Left in place and reported - collapsing them would make results non-comparable with published PlantDoc numbers |
+| field train vs val | Assigned per duplicate CLUSTER via a deterministic content hash, so a near-duplicate pair cannot straddle them |
+| Duplicates within field/train | Collapsed to one copy |
+| Overlap with PlantVillage | Dropped - it would be a leak straight into the lab test split |
+
+**Training mix**: ~1.5k field images against ~44k lab ones. Concatenating them
+would make field data ~3% of each batch, so the two streams are sampled at
+`config.DOMAIN_MIX` (0.5) and validation is blended in the same proportion -
+otherwise early stopping keeps selecting the lab-specialised checkpoint.
 
 `prepare_dataset.py` maps PlantDoc's folder names onto PlantVillage's label space
 via an explicit table (`PLANTDOC_TO_PV`). Only classes present in **both** label

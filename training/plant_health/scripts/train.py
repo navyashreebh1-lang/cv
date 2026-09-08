@@ -16,6 +16,7 @@ Writes to models/:
 """
 
 import argparse
+import math
 import json
 import sys
 from pathlib import Path
@@ -27,40 +28,148 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config as C  # noqa: E402
 
 
+def _load_split(directory: Path, class_names: list[str] | None, shuffle: bool):
+    """One directory -> a batched dataset. `class_names` pins the label order."""
+    present = None
+    if class_names is not None:
+        present = [c for c in class_names if (directory / c).is_dir()
+                   and any((directory / c).iterdir())]
+        if not present:
+            return None, []
+    ds = tf.keras.utils.image_dataset_from_directory(
+        directory,
+        labels="inferred",
+        label_mode="categorical",
+        class_names=present,
+        image_size=(C.IMG_SIZE, C.IMG_SIZE),
+        batch_size=C.BATCH_SIZE,
+        shuffle=shuffle,
+        seed=C.SEED,
+        interpolation="bilinear",
+    )
+    return ds, list(ds.class_names)
+
+
+def _to_global_labels(ds, local_names: list[str], global_names: list[str]):
+    """Re-express one-hot labels in the GLOBAL class space.
+
+    The field split only covers 22 of the 34 trained classes, so a dataset
+    loaded from it produces 22-wide one-hot vectors whose indices mean
+    something different from the lab dataset's. Feeding those to the model
+    would train every field image against the wrong class. This maps each local
+    index onto its global index with a constant gather matrix.
+    """
+    if local_names == global_names:
+        return ds
+    m = np.zeros((len(local_names), len(global_names)), dtype="float32")
+    for i, name in enumerate(local_names):
+        m[i, global_names.index(name)] = 1.0
+    matrix = tf.constant(m)
+    return ds.map(lambda x, y: (x, tf.matmul(y, matrix)),
+                  num_parallel_calls=tf.data.AUTOTUNE)
+
+
+def _count_images(directory: Path, class_names: list[str]) -> int:
+    if not directory.exists():
+        return 0
+    return sum(len(list((directory / c).glob("*")))
+               for c in class_names if (directory / c).is_dir())
+
+
 def build_datasets():
+    """Lab (PlantVillage) + field (PlantDoc) training and validation streams.
+
+    The lab set is ~44k images and the field set ~1.5k. Concatenating them
+    would make field data roughly 3% of every batch, and the model would go on
+    ignoring exactly the domain it is failing on - so the two streams are
+    sampled at a fixed ratio (config.DOMAIN_MIX) instead. Validation is blended
+    in the same proportion, because a validation set dominated by 6.7k lab
+    images would keep selecting the lab-specialised checkpoint this change
+    exists to avoid.
+
+    Returns (train_ds, val_ds, class_names, steps_per_epoch, sizes).
+    """
     if not (C.WORK_DIR / "train").exists():
         sys.exit("[train] No prepared dataset. Run scripts/prepare_dataset.py first.")
 
-    def load(split, shuffle):
-        return tf.keras.utils.image_dataset_from_directory(
-            C.WORK_DIR / split,
-            labels="inferred",
-            # One-hot, not integer, labels. Keras 3 removed `label_smoothing`
-            # from SparseCategoricalCrossentropy - and could not sensibly have
-            # kept it, because smoothing spreads epsilon mass across the whole
-            # label vector and a bare class index has no vector to spread it
-            # over. CategoricalCrossentropy does support it and needs one-hot
-            # targets, so the conversion happens here, at load time.
-            # `class_weight` is unaffected: Keras maps one-hot targets back to
-            # class ids with argmax before applying the weights.
-            label_mode="categorical",
-            image_size=(C.IMG_SIZE, C.IMG_SIZE),
-            batch_size=C.BATCH_SIZE,
-            shuffle=shuffle,
-            seed=C.SEED,
-            interpolation="bilinear",
-        )
-
-    train_ds = load("train", True)
-    val_ds = load("val", False)
-    class_names = list(train_ds.class_names)
+    lab_train, class_names = _load_split(C.WORK_DIR / "train", None, True)
+    lab_val, val_names = _load_split(C.WORK_DIR / "val", None, False)
 
     # Sanity: val must expose exactly the same label space, in the same order.
-    val_names = list(val_ds.class_names)
     if val_names != class_names:
-        sys.exit(f"[train] FATAL: train/val class mismatch.\n  train={class_names}\n  val={val_names}")
+        sys.exit(f"[train] FATAL: train/val class mismatch.\n"
+                 f"  train={class_names}\n  val={val_names}")
 
-    return train_ds, val_ds, class_names
+    n_lab_train = _count_images(C.WORK_DIR / "train", class_names)
+    n_lab_val = _count_images(C.WORK_DIR / "val", class_names)
+
+    field_train_dir = C.FIELD_DIR / "train"
+    field_val_dir = C.FIELD_DIR / "val"
+    has_field = field_train_dir.exists() and _count_images(field_train_dir, class_names) > 0
+
+    if not has_field:
+        print("[train] WARNING: no field/train split found - training LAB-ONLY. "
+              "Run scripts/prepare_dataset.py to build it. The lab-only model is "
+              "the one that scored 18% on field images.")
+        steps = math.ceil(n_lab_train / C.BATCH_SIZE)
+        return (lab_train.prefetch(tf.data.AUTOTUNE),
+                lab_val.prefetch(tf.data.AUTOTUNE),
+                class_names, steps,
+                {"lab_train": n_lab_train, "field_train": 0,
+                 "lab_val": n_lab_val, "field_val": 0})
+
+    field_train, f_train_names = _load_split(field_train_dir, class_names, True)
+    field_val, f_val_names = _load_split(field_val_dir, class_names, False)
+    field_train = _to_global_labels(field_train, f_train_names, class_names)
+
+    n_field_train = _count_images(field_train_dir, class_names)
+    n_field_val = _count_images(field_val_dir, class_names)
+    print(f"[train] lab train {n_lab_train:,} | field train {n_field_train:,} "
+          f"({len(f_train_names)} of {len(class_names)} classes present)")
+
+    # ---- training stream -------------------------------------------------
+    # Unbatch before sampling so a single batch contains BOTH domains. Sampling
+    # batched datasets would give homogeneous batches, which is worse for
+    # BatchNorm. Both streams repeat, so the epoch length is set explicitly and
+    # stays what it was before this change - the LR schedule and epoch counts
+    # keep their meaning.
+    mix = float(C.DOMAIN_MIX)
+    train_ds = tf.data.Dataset.sample_from_datasets(
+        [lab_train.unbatch().repeat(), field_train.unbatch().repeat()],
+        weights=[1.0 - mix, mix],
+        seed=C.SEED,
+        stop_on_empty_dataset=False,
+    ).batch(C.BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    steps = math.ceil(n_lab_train / C.BATCH_SIZE)
+    print(f"[train] domain mix {1 - mix:.0%} lab / {mix:.0%} field, "
+          f"{steps} steps per epoch")
+
+    # ---- validation blend ------------------------------------------------
+    # All of field/val, plus a deterministic sample of lab/val of comparable
+    # size. Shuffled with a fixed seed and reshuffle_each_iteration=False, so
+    # the validation set is identical on every epoch and every run - a moving
+    # validation set would make early stopping and val_loss meaningless.
+    if field_val is not None and n_field_val > 0:
+        field_val = _to_global_labels(field_val, f_val_names, class_names)
+        share = float(C.VAL_FIELD_FRACTION)
+        n_lab_keep = int(round(n_field_val * (1 - share) / max(share, 1e-6)))
+        n_lab_keep = max(1, min(n_lab_keep, n_lab_val))
+        lab_val_part = (lab_val.unbatch()
+                        .shuffle(min(n_lab_val, 10000), seed=C.SEED,
+                                 reshuffle_each_iteration=False)
+                        .take(n_lab_keep))
+        val_ds = (lab_val_part.concatenate(field_val.unbatch())
+                  .batch(C.BATCH_SIZE).prefetch(tf.data.AUTOTUNE))
+        print(f"[train] validation blend: {n_lab_keep:,} lab + {n_field_val:,} field")
+    else:
+        print("[train] WARNING: no field/val split - validating on lab images only, "
+              "which will select a lab-specialised checkpoint.")
+        val_ds = lab_val.prefetch(tf.data.AUTOTUNE)
+        n_field_val = 0
+
+    return (train_ds, val_ds, class_names, steps,
+            {"lab_train": n_lab_train, "field_train": n_field_train,
+             "lab_val": n_lab_val, "field_val": n_field_val})
 
 
 def build_augmenter():
@@ -131,9 +240,19 @@ def build_model(num_classes: int):
     return model, base
 
 
-def compute_class_weights(train_dir: Path, class_names: list[str]) -> dict:
-    counts = np.array([len(list((train_dir / c).glob("*"))) for c in class_names],
-                      dtype=np.float64)
+def compute_class_weights(train_dirs, class_names: list[str]) -> dict:
+    """Counts are summed over EVERY training directory - lab and field.
+
+    Weighting on the lab counts alone would misstate the balance of the pool
+    the model actually sees now that field data is mixed in at
+    config.DOMAIN_MIX.
+    """
+    if isinstance(train_dirs, Path):
+        train_dirs = [train_dirs]
+    counts = np.array(
+        [sum(len(list((d / c).glob("*"))) for d in train_dirs if (d / c).is_dir())
+         for c in class_names],
+        dtype=np.float64)
     counts = np.maximum(counts, 1.0)
     weights = counts.sum() / (len(counts) * counts)
     return {i: float(w) for i, w in enumerate(weights)}
@@ -192,17 +311,19 @@ def main() -> None:
 
     print(f"[train] TensorFlow {tf.__version__}, GPUs: {tf.config.list_physical_devices('GPU')}")
 
-    train_ds, val_ds, class_names = build_datasets()
+    train_ds, val_ds, class_names, steps_per_epoch, sizes = build_datasets()
     num_classes = len(class_names)
     print(f"[train] {num_classes} classes")
 
-    class_weight = compute_class_weights(C.WORK_DIR / "train", class_names)
+    train_dirs = [C.WORK_DIR / "train"]
+    if sizes["field_train"]:
+        train_dirs.append(C.FIELD_DIR / "train")
+    class_weight = compute_class_weights(train_dirs, class_names)
     imbalance = max(class_weight.values()) / min(class_weight.values())
     print(f"[train] class imbalance ratio: {imbalance:.1f}x (weights applied)")
 
-    AUTOTUNE = tf.data.AUTOTUNE
-    train_ds = train_ds.prefetch(AUTOTUNE)
-    val_ds = val_ds.cache().prefetch(AUTOTUNE)
+    # build_datasets() already batched, mixed and prefetched both streams; the
+    # training stream repeats indefinitely, so it must not be cached here.
 
     model, base = build_model(num_classes)
 
@@ -240,6 +361,7 @@ def main() -> None:
     model.compile(optimizer=tf.keras.optimizers.Adam(C.LR_HEAD),
                   loss=loss, metrics=metrics)
     model.fit(train_ds, validation_data=val_ds, epochs=args.epochs_head,
+              steps_per_epoch=steps_per_epoch,
               class_weight=class_weight, callbacks=callbacks, verbose=2)
 
     # ---- Phase 2: fine-tune -------------------------------------------------
@@ -259,6 +381,7 @@ def main() -> None:
     model.compile(optimizer=tf.keras.optimizers.Adam(C.LR_FINETUNE),
                   loss=loss, metrics=metrics)
     model.fit(train_ds, validation_data=val_ds, epochs=args.epochs_finetune,
+              steps_per_epoch=steps_per_epoch,
               class_weight=class_weight, callbacks=callbacks, verbose=2)
 
     model.save(C.MODELS_DIR / "final_model.keras")
@@ -272,9 +395,15 @@ def main() -> None:
         "finetune_at_fraction": C.FINETUNE_AT,
         "optimizer": "Adam", "label_smoothing": C.LABEL_SMOOTHING,
         "augmentation": C.AUG, "split_fractions": C.SPLIT_FRACTIONS,
-        "class_weighting": "balanced (n/(k*n_c))",
+        "class_weighting": "balanced (n/(k*n_c)) over lab+field train",
         "class_imbalance_ratio": round(imbalance, 2),
         "num_classes": num_classes, "tensorflow": tf.__version__,
+        # Which domains this run actually saw, so a result can never be
+        # attributed to the wrong training set after the fact.
+        "domain_mix_field_fraction": C.DOMAIN_MIX,
+        "val_field_fraction": C.VAL_FIELD_FRACTION,
+        "steps_per_epoch": steps_per_epoch,
+        "dataset_sizes": sizes,
     }, indent=2))
 
     print(f"\n[train] done."

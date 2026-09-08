@@ -13,8 +13,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DATASET_DIR = ROOT / "dataset"
 RAW_DIR = DATASET_DIR / "raw"          # untouched downloads
-WORK_DIR = DATASET_DIR / "work"        # cleaned + split, class-per-folder
-OOD_DIR = DATASET_DIR / "ood"          # PlantDoc field images (never trained on)
+WORK_DIR = DATASET_DIR / "work"        # PlantVillage (lab), cleaned + split
+FIELD_DIR = DATASET_DIR / "field"      # PlantDoc (field), cleaned + split
+# The held-out field test set. This is PlantDoc's OWN published test split and
+# nothing in it is ever trained on. evaluate.py reads this path, so pointing it
+# here is what makes the second reported set the held-out FIELD test.
+#
+# Naming note: evaluate.py still labels this section "out_of_domain_plantdoc".
+# Since PlantDoc's train split now contributes to training, this set is no
+# longer out-of-DOMAIN in the strict sense - it is a held-out set from a domain
+# the model has seen. It remains a genuine generalisation test (those exact
+# images, and every near-duplicate of them, are excluded from training), but
+# the key name overstates it. Renaming it means editing evaluate.py, which is
+# deliberately untouched in this change.
+OOD_DIR = FIELD_DIR / "test"
 MODELS_DIR = ROOT / "models"
 REPORTS_DIR = MODELS_DIR / "reports"
 
@@ -122,6 +134,37 @@ REDUCE_LR_PATIENCE = 3
 # same physical leaf; splitting per-image puts the same leaf in train and test
 # and inflates the score. Clusters are assigned atomically to one split.
 SPLIT_FRACTIONS = {"train": 0.70, "val": 0.15, "test": 0.15}
+
+# ---------------------------------------------------------------------------
+# Field domain (PlantDoc)
+# ---------------------------------------------------------------------------
+# The first training run scored 96.12% on the PlantVillage test split and
+# 18.18% on PlantDoc - a 78-point domain gap. Its binary health accuracy on
+# PlantDoc (82.85%) was only ~4.7 points better than always answering
+# "unhealthy", because 78.2% of that set IS unhealthy. The model had learned
+# PlantVillage's capture conditions, not the disease.
+#
+# The only reliable fix for a domain gap is data from that domain, so PlantDoc's
+# own train split now contributes to training. Its published TEST split stays
+# completely held out and is the honest field number.
+#
+# Test is NOT re-split: keeping PlantDoc's published split means the result
+# stays comparable with the PlantDoc literature and cannot be accused of split
+# shopping. Only its train split is divided, and by duplicate CLUSTER, never
+# per image.
+FIELD_SPLIT_FRACTIONS = {"train": 0.85, "val": 0.15}
+
+# Fraction of each training batch drawn from the field domain.
+# There are ~1.5k field images against ~44k lab ones. Concatenating them would
+# make field data ~3% of every batch and the model would carry on ignoring it,
+# so the two streams are sampled at a fixed ratio instead.
+DOMAIN_MIX = 0.5
+
+# Validation is blended in the same proportion. Left as pure PlantVillage,
+# early stopping and checkpoint selection would be decided by ~6.7k lab images
+# and would keep selecting the lab-specialised model this change exists to
+# avoid.
+VAL_FIELD_FRACTION = 0.5
 
 # Augmentation - realistic field variation only. Nothing here should be able to
 # turn a healthy leaf into something that looks diseased (no hue shifts, no
