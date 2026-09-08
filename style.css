@@ -470,9 +470,12 @@ a:focus-visible {
     display: none;
 }
 
+/* Comes forward out of the frame rather than just fading up - same depth
+   language as the viewfinder. The translate(-50%, -50%) that centres the card
+   has to be repeated in every keyframe or the card jumps to the corner. */
 @keyframes no-plant-pop {
-    from { opacity: 0; transform: translate(-50%, -50%) scale(0.94); }
-    to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+    from { opacity: 0; transform: translate(-50%, -50%) perspective(600px) translateZ(-70px) rotateX(9deg); }
+    to   { opacity: 1; transform: translate(-50%, -50%) perspective(600px) translateZ(0) rotateX(0deg); }
 }
 
 .no-plant-icon {
@@ -542,9 +545,15 @@ a:focus-visible {
 }
 
 /* Controls.
-   MOBILE: a 2-column grid - [START CAM][STOP CAM] / [START DET][STOP DET].
-   Each button is a >=48px touch target. Larger screens switch to one row
-   (see the >=768px block). */
+   MOBILE: a compact 2x2 grid - [START CAMERA][STOP CAMERA] /
+   [START DETECTION][STOP DETECTION]. Larger screens switch to one row (see the
+   >=768px block).
+
+   The two columns are deliberately FULL-WIDTH 1fr, not narrower content-sized
+   ones. "START DETECTION" is the longest label and at 375px it needs ~160px of
+   the ~174px column; capping the grid narrower makes that label wrap to two
+   lines, which makes the button TALLER, not smaller. So the compactness comes
+   from height, padding and icon size - measured in _probe/btn_check.html. */
 .camera-controls {
     order: 2;
     display: grid;
@@ -554,8 +563,8 @@ a:focus-visible {
 
 .btn {
     min-width: 0;
-    min-height: 48px;
-    padding: 0.75rem 0.75rem;
+    min-height: 44px;
+    padding: 0.5rem 0.6rem;
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-sm);
     font-size: clamp(0.75rem, 2.7vw, 0.875rem);
@@ -568,7 +577,7 @@ a:focus-visible {
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 0.4rem;
+    gap: 0.35rem;
     text-align: center;
     /* Glass fill: translucent surface + blur, so buttons read as part of the
        same material as the cards. The accent colour lives in the tint + border. */
@@ -580,11 +589,17 @@ a:focus-visible {
 }
 
 .btn:active:not(:disabled) {
-    transform: translateY(1px) scale(0.985);
+    /* The press goes into Z. Per-element perspective() keeps the 3D local -
+       no perspective on any ancestor, so nothing else in the layout is
+       affected and the resting state stays perfectly flat (and crisp). */
+    transform: perspective(600px) translate3d(0, 1px, -14px) rotateX(5deg);
+    transition-duration: 0.06s;
 }
 
+/* Icon sits a little under the label's cap height - present, not shouty. */
 .btn-icon {
-    font-size: 1rem;
+    font-size: 0.9rem;
+    line-height: 1;
 }
 
 /* `.btn-text` is the button's ONE label, shown at every width. Deliberately
@@ -838,20 +853,25 @@ a:focus-visible {
     .camera-wrapper { max-height: min(42vh, 260px); }
 
     /* ---- Controls ----------------------------------------------------------
-       2-column grid at every phone width, icons always visible, short labels. */
-    .camera-controls { gap: 0.5rem; }
+       2 x 2 grid at every phone width, icons always visible, one label per
+       button (never a shortened variant). */
+    .camera-controls { gap: 0.45rem; }
 
+    /* 40px is the FLOOR, not a starting point: the label is a single 12px line
+       (~14px) so the box is min-height-driven, and dropping below 40 would trade
+       real tap accuracy for a few pixels. Width stays a full 1fr column - see
+       the note on .camera-controls above for why narrowing it backfires. */
     .btn {
-        min-height: 44px;              /* still a comfortable touch target */
-        padding: 0.55rem 0.6rem;
-        gap: 0.35rem;
+        min-height: 40px;
+        padding: 0.3rem 0.5rem;
+        gap: 0.3rem;
     }
 
-    .btn .btn-icon { font-size: 0.9rem; }
+    .btn .btn-icon { font-size: 0.8rem; }
 
-    /* The full label can need two lines in the narrow 2-column grid; 1.6 line
-       leading would make that look loose, and the button grows past its 44px
-       minimum on its own. */
+    /* Every label fits one line from 360px up, but on a narrower phone it can
+       still need two; 1.6 line leading would make that look loose, and the
+       button grows past its 40px minimum on its own. */
     .btn-text { line-height: 1.2; }
 
     .panel { padding: 0.8rem; }
@@ -950,9 +970,9 @@ a:focus-visible {
        detection result off the first screen) and the icons stay visible; the
        label wraps to a second line rather than being shortened. */
     .container { gap: 0.6rem; }
-    .camera-controls { gap: 0.4rem; }
-    .btn { padding-left: 0.4rem; padding-right: 0.4rem; letter-spacing: 0.2px; }
-    .btn .btn-icon { font-size: 0.8rem; }
+    .camera-controls { gap: 0.35rem; }
+    .btn { padding-left: 0.35rem; padding-right: 0.35rem; letter-spacing: 0.2px; }
+    .btn .btn-icon { font-size: 0.75rem; }
 }
 
 /* ---- Short phones (<= 700px tall) -------------------------------------------
@@ -989,13 +1009,12 @@ a:focus-visible {
         padding-bottom: 0.3rem;
     }
 
-    .camera-controls { gap: 0.35rem; }
+    .camera-controls { gap: 0.3rem; }
 
-    .btn {
-        min-height: 40px;              /* still a comfortable touch target */
-        padding-top: 0.3rem;
-        padding-bottom: 0.3rem;
-    }
+    /* Same 40px floor as every other phone width - the compact padding now
+       lives in the base <=767px block, so there is nothing left to shave here
+       without going under the touch target. */
+    .btn { min-height: 40px; }
 
     .detection-summary { gap: 0.3rem; }
 
@@ -1040,11 +1059,16 @@ a:focus-visible {
     .camera-controls {
         display: flex;
         flex-wrap: wrap;
-        gap: 0.75rem;
+        gap: 0.6rem;
     }
+    /* Two per row. A 200px basis used to wrap 3 + 1, leaving the last button
+       stretched across the full width; anything small enough to fit four across
+       at 768px is too narrow for "START DETECTION" at this font size, so the
+       label wrapped to two lines and the button got TALLER. A half-width basis
+       gives a tidy 2 x 2 with every label on one line. */
     .btn {
-        flex: 1 1 200px;
-        padding: 0.75rem 1rem;
+        flex: 1 1 calc(50% - 0.3rem);
+        padding: 0.45rem 0.75rem;
     }
     .btn .btn-icon { display: inline; }
 
@@ -1130,9 +1154,27 @@ a:focus-visible {
         min-height: 320px;
     }
 
+    /* Desktop layout is unchanged: buttons stretch to fill the row and stay
+       aligned with the camera frame's edges. The 160px floor is what makes a
+       narrow desktop fall back to 2 x 2 with single-line labels rather than
+       squeezing four across and wrapping the text. */
     .btn {
         flex: 1 1 0;
         min-width: 160px;
+    }
+}
+
+/* ---- 1025-1239px : narrow desktop --------------------------------------
+   The sidebar takes its fixed width out of the row here, so four buttons
+   across leaves each one too narrow for "START DETECTION" on a single line
+   (measured: a clean fit needs ~1180px+, comfortable from ~1240px). Below that
+   the old one-row rule degraded into 3 + 1 with the last button stretched
+   across the whole width, or four buttons with two-line labels. A 2 x 2 here
+   keeps every label on one line and every button the same size. */
+@media (min-width: 1025px) and (max-width: 1239px) {
+    .btn {
+        flex: 1 1 calc(50% - 0.3rem);
+        min-width: 0;
     }
 }
 
@@ -1166,6 +1208,355 @@ a:focus-visible {
    states on touch. */
 @media (hover: hover) and (pointer: fine) {
     .btn:hover:not(:disabled) {
-        transform: translateY(-1px);
+        transform: perspective(700px) translate3d(0, -1px, 6px);
     }
+}
+
+/* ==========================================================================
+   INSTRUMENT LAYER - depth, drawn marks, and four moments of motion
+   --------------------------------------------------------------------------
+   The idea: this is an optical instrument pointed at a plant, not a dashboard.
+   So the colour split carries meaning rather than decoration -
+       cyan  = the machine looking (reticle, scan sweep)
+       green = life found (lock ring, marks, results)
+   and motion is spent in four places only, each one answering something that
+   actually happened:
+       1. page load            - the instrument assembles out of depth
+       2. camera opens         - the viewfinder corners draw themselves in
+       3. detection runs       - a plane of light sweeps the frame
+       4. a plant is confirmed - one lock pulse, corners go green
+
+   Everything here is CSS. No library, no extra rAF, no JS: the states above
+   are read straight out of the DOM the app already maintains -
+       #stopCameraBtn:not(:disabled)      = camera running
+       #stopDetectionBtn:not(:disabled)   = detection running
+       .summary-indicator.detected        = >= 1 confirmed plant
+   with :has(). Detection, counting, confidence and Model 2 are untouched, and
+   in a browser without :has() the extra motion simply never starts.
+
+   Only transform and opacity are animated (compositor-only, no layout), and
+   the single looping animation runs only while detection is already running.
+   ========================================================================== */
+
+:root {
+    --instrument: #22d3ee;          /* the machine looking */
+    --instrument-soft: rgba(34, 211, 238, 0.55);
+    --lock: #34d399;                /* something alive, found */
+}
+
+/* ---- 1. LOAD: the instrument assembles ---------------------------------- */
+
+.camera-wrapper {
+    animation: lens-in 0.85s cubic-bezier(0.2, 0.75, 0.25, 1) both;
+}
+
+.camera-controls .btn { animation: control-in 0.5s cubic-bezier(0.2, 0.8, 0.3, 1) both; }
+.camera-controls .btn:nth-child(1) { animation-delay: 0.30s; }
+.camera-controls .btn:nth-child(2) { animation-delay: 0.36s; }
+.camera-controls .btn:nth-child(3) { animation-delay: 0.42s; }
+.camera-controls .btn:nth-child(4) { animation-delay: 0.48s; }
+
+.panel { animation: plate-in 0.7s cubic-bezier(0.2, 0.8, 0.25, 1) both; }
+.panel--detection { animation-delay: 0.34s; }
+.panel--health    { animation-delay: 0.46s; }
+.flow-arrow       { animation: plate-in 0.5s ease-out 0.56s both; }
+
+@keyframes lens-in {
+    from { opacity: 0; transform: perspective(1200px) translate3d(0, 14px, -170px) rotateX(8deg); }
+    to   { opacity: 1; transform: none; }
+}
+
+@keyframes control-in {
+    from { opacity: 0; transform: perspective(800px) translate3d(0, 8px, -70px); }
+    to   { opacity: 1; transform: none; }
+}
+
+/* Glass plates settling onto the stack. The entrance moves in Y and Z only -
+   an X offset would push the panel past the right edge for the first half
+   second (harmless, since body has overflow-x: hidden, but it shows up as
+   transient horizontal overflow in the probes and there is no reason to
+   create it). The rotateY supplies all the sideways interest. */
+@keyframes plate-in {
+    from { opacity: 0; transform: perspective(1000px) rotateY(-7deg) translate3d(0, 10px, -120px); }
+    to   { opacity: 1; transform: none; }
+}
+
+/* ---- The drawn sprout --------------------------------------------------- */
+
+.logo {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+}
+
+/* The gradient-clipped fill moves to the word so the SVG keeps its own paint. */
+.logo-word {
+    background: inherit;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+}
+
+.logo-mark {
+    flex: 0 0 auto;
+    overflow: visible;
+    filter: drop-shadow(0 2px 6px rgba(16, 185, 129, 0.35));
+}
+
+/* The blade unfolds from the stem end (fill-box puts the pivot on the leaf's
+   own bottom-left, where it would join a stem), then the midrib draws along
+   it - grown, not faded in. */
+.logo-blade {
+    transform-box: fill-box;
+    transform-origin: 0 100%;
+    animation: blade-unfold 0.6s cubic-bezier(0.2, 0.9, 0.3, 1) 0.2s both;
+}
+
+.logo-rib {
+    stroke-dasharray: 22;
+    animation: rib-draw 0.55s cubic-bezier(0.4, 0, 0.2, 1) 0.6s both;
+}
+
+@keyframes blade-unfold { from { opacity: 0; transform: scale(0.15) rotate(-22deg); }
+                          to   { opacity: 1; transform: none; } }
+@keyframes rib-draw     { from { stroke-dashoffset: 22; } to { stroke-dashoffset: 0; } }
+
+/* ---- Panel marks and the health watermark ------------------------------- */
+
+.panel-title {
+    display: flex;
+    align-items: center;
+    gap: 0.42rem;
+}
+
+.panel-ico {
+    flex: 0 0 auto;
+    color: var(--primary-color);
+}
+
+.panel--health { position: relative; overflow: hidden; }
+
+/* A leaf pressed into the card like a watermark into paper. Deliberately faint
+   and static: it gives the health card a subject while there is no verdict,
+   without competing with one once there is. */
+.leaf-watermark {
+    position: absolute;
+    right: -18px;
+    bottom: -22px;
+    width: 132px;
+    height: 132px;
+    color: var(--primary-color);
+    opacity: 0.07;
+    pointer-events: none;
+    z-index: 0;
+}
+
+.panel--health .panel-header,
+.panel--health .health-body { position: relative; z-index: 1; }
+
+/* ---- 2-4. THE VIEWFINDER ------------------------------------------------ */
+
+.viewfinder {
+    position: absolute;
+    inset: 0;
+    z-index: 5;                    /* canvas < viewfinder < popup(8) < overlay(10) */
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.4s ease;
+    border-radius: inherit;
+    overflow: hidden;
+}
+
+/* 2. The camera is open: the reticle draws itself in. */
+body:has(#stopCameraBtn:not(:disabled)) .viewfinder { opacity: 1; }
+
+.vf-corner {
+    position: absolute;
+    width: 26px;
+    height: 26px;
+    border: 2px solid var(--instrument-soft);
+    border-radius: 3px;
+    opacity: 0;
+    transition: border-color 0.45s ease, box-shadow 0.45s ease;
+}
+
+.vf-corner--tl { top: 10px;    left: 10px;  border-right: 0; border-bottom: 0; transform-origin: 0 0; }
+.vf-corner--tr { top: 10px;    right: 10px; border-left: 0;  border-bottom: 0; transform-origin: 100% 0; }
+.vf-corner--bl { bottom: 10px; left: 10px;  border-right: 0; border-top: 0;    transform-origin: 0 100%; }
+.vf-corner--br { bottom: 10px; right: 10px; border-left: 0;  border-top: 0;    transform-origin: 100% 100%; }
+
+body:has(#stopCameraBtn:not(:disabled)) .vf-corner {
+    animation: corner-draw 0.55s cubic-bezier(0.2, 0.85, 0.3, 1) both;
+}
+body:has(#stopCameraBtn:not(:disabled)) .vf-corner--tr { animation-delay: 0.06s; }
+body:has(#stopCameraBtn:not(:disabled)) .vf-corner--bl { animation-delay: 0.12s; }
+body:has(#stopCameraBtn:not(:disabled)) .vf-corner--br { animation-delay: 0.18s; }
+
+/* The reticle scales with the frame: a 26px corner is right on a 190px phone
+   preview and lost on a 700px desktop one. */
+@media (min-width: 768px) {
+    .vf-corner { width: 34px; height: 34px; }
+    .vf-corner--tl, .vf-corner--tr { top: 14px; }
+    .vf-corner--bl, .vf-corner--br { bottom: 14px; }
+    .vf-corner--tl, .vf-corner--bl { left: 14px; }
+    .vf-corner--tr, .vf-corner--br { right: 14px; }
+}
+
+@media (min-width: 1025px) {
+    /* Size only. Do NOT set `border-width` here: the shorthand writes all four
+       sides and would restore the two borders the corner modifiers zero out,
+       turning each L-bracket back into a closed square. */
+    .vf-corner { width: 44px; height: 44px; }
+}
+
+@keyframes corner-draw {
+    from { opacity: 0; transform: perspective(500px) scale(0.35) translateZ(-40px); }
+    to   { opacity: 1; transform: none; }
+}
+
+/* 3. Detection is running: a plane of light sweeps down the frame. It is a
+      volume, not a line - tilted back and narrower at the top, flattening and
+      widening as it arrives, so it reads as sweeping THROUGH the scene toward
+      the viewer rather than sliding across a flat picture. */
+.vf-scan {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    height: 34%;
+    opacity: 0;
+    transform-origin: 50% 100%;
+    /* `screen` so the sweep ADDS light to the feed instead of laying a pale
+       sheet over it - the plant underneath keeps its own colour and the
+       operator never loses sight of the subject mid-scan. */
+    mix-blend-mode: screen;
+    background: linear-gradient(to bottom,
+        rgba(34, 211, 238, 0) 0%,
+        rgba(34, 211, 238, 0.035) 55%,
+        rgba(34, 211, 238, 0.14) 88%,
+        rgba(165, 243, 252, 0.45) 100%);
+}
+
+body:has(#stopDetectionBtn:not(:disabled)) .vf-scan {
+    animation: scan-sweep 3.4s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
+    will-change: transform, opacity;
+}
+
+@keyframes scan-sweep {
+    0%   { opacity: 0;   transform: perspective(620px) translate3d(0, -34%, -120px) rotateX(58deg) scaleX(0.76); }
+    18%  { opacity: 0.7; }
+    82%  { opacity: 0.7; }
+    100% { opacity: 0;    transform: perspective(620px) translate3d(0, 100%, 0) rotateX(0deg) scaleX(1); }
+}
+
+/* 4. A plant is confirmed: the reticle turns green and the frame locks on -
+      one pulse, which re-runs each time the state flips back to detected. */
+body:has(.summary-indicator.detected) .vf-corner {
+    border-color: var(--lock);
+    box-shadow: 0 0 14px rgba(52, 211, 153, 0.45);
+}
+
+.vf-lock {
+    position: absolute;
+    inset: 6px;
+    border: 1px solid rgba(52, 211, 153, 0.9);
+    border-radius: calc(var(--radius) - 4px);
+    opacity: 0;
+}
+
+body:has(.summary-indicator.detected) .vf-lock {
+    animation: lock-on 0.75s cubic-bezier(0.15, 0.7, 0.2, 1) 1;
+}
+
+@keyframes lock-on {
+    0%   { opacity: 0;   transform: perspective(700px) scale(1.07) translateZ(60px); }
+    35%  { opacity: 0.9; }
+    100% { opacity: 0;   transform: perspective(700px) scale(0.985) translateZ(0); }
+}
+
+/* The count gets the same lock moment, once, in the sidebar. */
+body:has(.summary-indicator.detected) .summary-stat--headline .summary-value {
+    animation: count-lock 0.5s cubic-bezier(0.2, 0.9, 0.3, 1) 1;
+}
+
+@keyframes count-lock {
+    from { transform: perspective(400px) translateZ(26px); }
+    to   { transform: none; }
+}
+
+/* ---- A verdict arriving --------------------------------------------------
+   renderHealth() rebuilds #plantHealth only when the signature changes, so a
+   CSS entrance here replays exactly once per NEW verdict and costs nothing
+   while a verdict is just being held. The rows deal in from below with a short
+   stagger, which makes "the answer changed" legible without a flash. */
+
+.health-plant {
+    animation: verdict-in 0.4s cubic-bezier(0.2, 0.8, 0.3, 1) both;
+}
+
+.health-row {
+    animation: verdict-in 0.42s cubic-bezier(0.2, 0.8, 0.3, 1) both;
+}
+
+/* Four rows per plant (crop / health / condition / confidence). The nth-child
+   counts include the .health-plant label when it is present, so the delays are
+   capped at a sixth step - a long list must not turn into a slow cascade. */
+.health-row:nth-child(1) { animation-delay: 0.02s; }
+.health-row:nth-child(2) { animation-delay: 0.06s; }
+.health-row:nth-child(3) { animation-delay: 0.10s; }
+.health-row:nth-child(4) { animation-delay: 0.14s; }
+.health-row:nth-child(5) { animation-delay: 0.18s; }
+.health-row:nth-child(n + 6) { animation-delay: 0.2s; }
+
+@keyframes verdict-in {
+    from { opacity: 0; transform: perspective(600px) translate3d(0, 6px, -30px); }
+    to   { opacity: 1; transform: none; }
+}
+
+/* The health note ("Waiting for plant detection…", "ANALYSIS UNCERTAIN", the
+   two model-missing states) is a whole-state change, not a row - fade it in as
+   one block instead of staggering. */
+.health-note {
+    animation: verdict-in 0.35s ease-out both;
+}
+
+/* ---- Model 2 verdict -----------------------------------------------------
+   HEALTHY / UNHEALTHY is the answer the health card exists to give, so it is
+   a pill like the detection status above it rather than one row among four.
+   Same shape as .summary-indicator so the two panels read as one flow. */
+.health-verdict {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.5rem 0.7rem;
+    margin-bottom: 0.4rem;
+    border-radius: var(--radius-sm);
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    font-size: 0.86rem;
+    border: 1px solid transparent;
+}
+
+.health-verdict-icon { font-size: 0.95rem; line-height: 1; }
+
+.health-verdict.is-healthy {
+    color: #d1fae5;
+    background: rgba(16, 185, 129, 0.16);
+    border-color: rgba(16, 185, 129, 0.4);
+    box-shadow: var(--accent-glow);
+}
+
+.health-verdict.is-unhealthy {
+    color: #fef3c7;
+    background: rgba(245, 158, 11, 0.16);
+    border-color: rgba(245, 158, 11, 0.42);
+    box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.22), 0 6px 24px rgba(245, 158, 11, 0.14);
+}
+
+/* Second line of the model-missing state: what to do about it, not a code. */
+.health-note--why {
+    font-size: 0.72rem;
+    line-height: 1.4;
+    margin-top: 0.2rem;
+    opacity: 0.75;
 }

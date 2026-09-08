@@ -100,8 +100,26 @@ def health_metrics(y_true, y_pred, class_names) -> dict:
 
     n_unhealthy = tp + fn
     n_healthy = tn + fp
+
+    # HEALTHY vs UNHEALTHY is what the app actually shows the user, so it gets
+    # its own precision/recall/F1 and its own 2x2 confusion matrix rather than
+    # only living inside the 38-class numbers. "Positive" = UNHEALTHY, because
+    # the error that matters in the field is missing a diseased plant.
+    precision = tp / (tp + fp) if (tp + fp) else None
+    recall = tp / (tp + fn) if (tp + fn) else None
+    f1 = (2 * precision * recall / (precision + recall)
+          if precision and recall and (precision + recall) else None)
+
     return {
+        "positive_class": "UNHEALTHY",
         "health_accuracy": float((t == p).mean()) if len(t) else 0.0,
+        "precision_unhealthy": precision,
+        "recall_unhealthy": recall,
+        "f1_unhealthy": f1,
+        "specificity_healthy": tn / n_healthy if n_healthy else None,
+        # rows = truth, cols = prediction, order [UNHEALTHY, HEALTHY]
+        "confusion_matrix": [[tp, fn], [fp, tn]],
+        "confusion_matrix_labels": ["UNHEALTHY", "HEALTHY"],
         "unhealthy_recall_disease_caught": tp / n_unhealthy if n_unhealthy else None,
         "missed_disease_rate_unhealthy_called_healthy": fn / n_unhealthy if n_unhealthy else None,
         "false_alarm_rate_healthy_called_unhealthy": fp / n_healthy if n_healthy else None,
@@ -163,6 +181,15 @@ def evaluate_one(model, directory: Path, class_names: list[str], stem: str) -> d
     print(f"  F1     (weighted) : {res['f1_weighted']:.4f}")
     h = res["health"]
     print(f"  health accuracy   : {h['health_accuracy']:.4f}")
+    fmt = lambda v: "n/a" if v is None else f"{v:.4f}"
+    print(f"  HEALTHY/UNHEALTHY (positive = UNHEALTHY):")
+    print(f"    precision       : {fmt(h['precision_unhealthy'])}")
+    print(f"    recall          : {fmt(h['recall_unhealthy'])}")
+    print(f"    F1              : {fmt(h['f1_unhealthy'])}")
+    cmh = h["confusion_matrix"]
+    print(f"    confusion       :            pred UNHEALTHY  pred HEALTHY")
+    print(f"      true UNHEALTHY            {cmh[0][0]:>8}      {cmh[0][1]:>8}")
+    print(f"      true HEALTHY              {cmh[1][0]:>8}      {cmh[1][1]:>8}")
     if h["missed_disease_rate_unhealthy_called_healthy"] is not None:
         print(f"  MISSED DISEASE    : {h['missed_disease_rate_unhealthy_called_healthy']:.4f} "
               f"({h['counts']['missed_disease']}/{h['counts']['true_unhealthy']}) "

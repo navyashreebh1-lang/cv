@@ -20,14 +20,21 @@ f.onload = () => {
     if (win.AGRIVISION && win.AGRIVISION.ui.state.modelReady) return start();
     setTimeout(waitReady, 150);
   };
+  // START DETECTION is disabled until the camera is actually running, and a
+  // click on a disabled button is silently dropped - waiting a fixed 2.5s
+  // sometimes fired too early and the shot came back showing 0 plants with
+  // detection never started. Wait for the button itself instead.
   const start = () => {
     win.__scenario = S;
     win.__health = q.get('health') || 'healthy';
     doc.getElementById('startCameraBtn').click();
-    setTimeout(() => {
-      doc.getElementById('startDetectionBtn').click();
-      setTimeout(() => { document.title = 'READY'; }, 3000);
-    }, 2500);
+    const btn = doc.getElementById('startDetectionBtn');
+    const armed = () => {
+      if (btn.disabled) return setTimeout(armed, 150);
+      btn.click();
+      setTimeout(() => { document.title = 'READY'; }, 3500);
+    };
+    armed();
   };
   waitReady();
 };

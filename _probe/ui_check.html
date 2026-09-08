@@ -1,5 +1,11 @@
 <!DOCTYPE html><html><head><meta charset="utf-8"><title>ui check</title></head><body>
 <pre id="log">starting…</pre><div id="stage"></div>
+<!-- Holds the load event open so --dump-dom fires after the run finishes,
+     WITHOUT --virtual-time-budget. Under virtual time getUserMedia never
+     resolves, so runDetection() has no video to read and EVERY plant scenario
+     reports 0 - an artifact of the runner, not of the pipeline. Needs a server
+     with a /slow?ms=N endpoint (see _probe/serve.py). -->
+<img src="/slow?ms=50000" alt="" width="1" height="1" style="opacity:0">
 <script>
 // Mounts the real app in an iframe of an exact viewport width (an iframe is its
 // own viewport, so media queries evaluate against the iframe - Chrome on Windows

@@ -48,8 +48,65 @@ def representative_dataset(class_names, n=200):
     return gen
 
 
+def _make_converter(model):
+    """Build a TFLiteConverter in a way that works on BOTH Keras 2 and Keras 3.
+
+    Colab now ships TensorFlow 2.16+ with Keras 3, where
+    `TFLiteConverter.from_keras_model()` on a functional Keras 3 model is no
+    longer the supported route and can fail outright. The supported Keras 3
+    path is to export a SavedModel first and convert that. Try the SavedModel
+    route when Keras 3 is detected, and keep the direct route as the fallback
+    (and the primary on Keras 2), so this script does not break on either.
+    """
+    keras_major = 0
+    try:
+        import keras
+        keras_major = int(str(keras.__version__).split(".")[0])
+    except Exception:
+        pass
+
+    attempts = []
+    if keras_major >= 3:
+        attempts = ["saved_model", "keras_model"]
+    else:
+        attempts = ["keras_model", "saved_model"]
+
+    last_error = None
+    for how in attempts:
+        try:
+            if how == "keras_model":
+                conv = tf.lite.TFLiteConverter.from_keras_model(model)
+            else:
+                export_dir = C.MODELS_DIR / "_saved_model"
+                if export_dir.exists():
+                    shutil.rmtree(export_dir)
+                # Keras 3 exposes .export(); Keras 2 needs tf.saved_model.save.
+                if hasattr(model, "export"):
+                    model.export(str(export_dir))
+                else:
+                    tf.saved_model.save(model, str(export_dir))
+                conv = tf.lite.TFLiteConverter.from_saved_model(str(export_dir))
+            print(f"[export] converter route: {how}")
+            return conv
+        except Exception as exc:      # noqa: BLE001 - report and try the other route
+            last_error = exc
+            print(f"[export] converter route '{how}' failed: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(f"Could not build a TFLiteConverter: {last_error}")
+
+
+def _make_interpreter(tflite_bytes: bytes):
+    """tf.lite.Interpreter is being moved out of TF into ai-edge-litert.
+    Use whichever this runtime actually provides."""
+    try:
+        return tf.lite.Interpreter(model_content=tflite_bytes)
+    except Exception:
+        from ai_edge_litert.interpreter import Interpreter    # TF >= 2.20
+        return Interpreter(model_content=tflite_bytes)
+
+
 def convert(model, class_names, int8: bool) -> bytes:
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter = _make_converter(model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     if int8:
         converter.representative_dataset = representative_dataset(class_names)
@@ -63,7 +120,7 @@ def convert(model, class_names, int8: bool) -> bytes:
 
 
 def verify(tflite_bytes: bytes, model, class_names, n=60) -> dict:
-    interp = tf.lite.Interpreter(model_content=tflite_bytes)
+    interp = _make_interpreter(tflite_bytes)
     interp.allocate_tensors()
     inp = interp.get_input_details()[0]
     out = interp.get_output_details()[0]

@@ -1480,6 +1480,17 @@ const Visualizer = {
         this.ctx = this.canvas.getContext('2d');
         this.resizeCanvas();
         window.addEventListener('resize', () => this.resizeCanvas());
+
+        // resizeCanvas() reads video.videoWidth, which is still 0 here - the
+        // camera has not been started yet - so this first call is a no-op and
+        // the canvas keeps its default 300x150 bitmap. Until now the only
+        // thing that ever recomputed it was a WINDOW RESIZE, so unless the
+        // user happened to resize after starting the camera, boxes were drawn
+        // in video coordinates onto a 300x150 canvas and landed in the wrong
+        // place. Size it when the stream's dimensions actually arrive.
+        const video = document.getElementById('cameraFeed');
+        video.addEventListener('loadedmetadata', () => this.resizeCanvas());
+        video.addEventListener('resize', () => this.resizeCanvas());
     },
 
     resizeCanvas() {
@@ -1506,51 +1517,123 @@ const Visualizer = {
     drawDetections(detections) {
         this.clear();
 
-        detections.forEach((detection, index) => {
+        // PRESENTATION ONLY. Nothing here reads or changes a threshold, a
+        // class filter, the tracker or the count - it draws the boxes the
+        // pipeline already decided on.
+        //
+        // Everything is sized in SCREEN units rather than video pixels. The
+        // canvas bitmap is the camera's NATIVE size (1280x720 for the usual
+        // stream) and CSS scales it down to fit the frame, so the old
+        // hard-coded `lineWidth = 3` / `14px` came out around 0.9px and 4px on
+        // a 369px-wide phone frame - nearly invisible - while looking oversized
+        // on a small feed. `u` is one CSS pixel expressed in canvas pixels, so
+        // strokes, corner marks and type keep the same visual weight at every
+        // camera resolution. (this.scale is computed in resizeCanvas() and was
+        // previously never used.)
+        // Cheap safety net for the same problem: if the bitmap does not match
+        // the stream (first frames after a camera restart, a track that
+        // changed resolution), re-derive it. Compares two numbers and only
+        // touches layout on an actual mismatch, so it costs nothing per frame.
+        const video = document.getElementById('cameraFeed');
+        if (video.videoWidth && this.canvas.width !== video.videoWidth) this.resizeCanvas();
+
+        const u = (isFinite(this.scale) && this.scale > 0) ? 1 / this.scale : 1;
+        const ctx = this.ctx;
+        const placedChips = [];   // label chips already drawn this frame
+
+        detections.forEach((detection) => {
             const box = detection.boundingBox;
 
-            // Confirmed plants are solid green. A confirmed-but-weak plant
-            // (score below temporal.strongScore) is drawn dashed amber - it
+            // Confirmed plants are green. A confirmed-but-weak plant (score
+            // below temporal.strongScore) is amber with a dashed body - it
             // still counts, but the box says the evidence is thin rather than
             // presenting a shaky detection as a solid one.
             const weak = detection.uncertain === true;
-            this.ctx.save();
-            this.ctx.strokeStyle = weak ? '#f59e0b' : '#10b981';
-            this.ctx.lineWidth = 3;
-            this.ctx.setLineDash(weak ? [8, 6] : []);
-            this.ctx.strokeRect(box.x, box.y, box.width, box.height);
-            this.ctx.restore();
+            const accent = weak ? '#f59e0b' : '#34d399';
+            const accentDim = weak ? 'rgba(245, 158, 11, 0.38)' : 'rgba(52, 211, 153, 0.38)';
 
-            // Draw background for text
-            // User-facing label. The raw COCO class name ("potted plant") is
-            // an implementation detail of the detector, so the box says PLANT.
+            // Hairline body: it delimits the plant without drawing a heavy
+            // cage over it. The weight is in the corners.
+            ctx.save();
+            ctx.strokeStyle = accentDim;
+            ctx.lineWidth = 1.5 * u;
+            ctx.setLineDash(weak ? [7 * u, 5 * u] : []);
+            ctx.strokeRect(box.x, box.y, box.width, box.height);
+            ctx.restore();
+
+            // Corner brackets, same reticle language as the viewfinder frame.
+            // Length is capped against the box so a small detection gets
+            // proportionate marks instead of four overlapping Ls.
+            const len = Math.min(22 * u, box.width * 0.3, box.height * 0.3);
+            ctx.save();
+            ctx.strokeStyle = accent;
+            ctx.lineWidth = 3 * u;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.shadowColor = weak ? 'rgba(245, 158, 11, 0.5)' : 'rgba(52, 211, 153, 0.5)';
+            ctx.shadowBlur = 8 * u;
+            const corners = [
+                [box.x, box.y, 1, 1],
+                [box.x + box.width, box.y, -1, 1],
+                [box.x, box.y + box.height, 1, -1],
+                [box.x + box.width, box.y + box.height, -1, -1]
+            ];
+            for (const [cx, cy, sx, sy] of corners) {
+                ctx.beginPath();
+                ctx.moveTo(cx + sx * len, cy);
+                ctx.lineTo(cx, cy);
+                ctx.lineTo(cx, cy + sy * len);
+                ctx.stroke();
+            }
+            ctx.restore();
+
+            // Label chip. The raw COCO class name ("potted plant") is an
+            // implementation detail of the detector, so the box says PLANT.
             // detection.className itself is untouched.
             const labelText = `PLANT ${detection.confidence}%`;
-            this.ctx.font = 'bold 14px Arial';
-            const textWidth = this.ctx.measureText(labelText).width;
-            const textHeight = 24;
+            ctx.save();
+            ctx.font = `600 ${13 * u}px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+            ctx.textBaseline = 'middle';
+            const padX = 7 * u;
+            const chipW = ctx.measureText(labelText).width + padX * 2;
+            const chipH = 21 * u;
+            const gap = 6 * u;
 
-            this.ctx.fillStyle = weak ? 'rgba(245, 158, 11, 0.9)' : 'rgba(16, 185, 129, 0.9)';
-            this.ctx.fillRect(box.x, box.y - textHeight - 5, textWidth + 10, textHeight);
+            // Keep the chip on screen: above the box normally, tucked inside
+            // the top edge when there is no room, and never past the right
+            // edge of the frame.
+            let chipY = box.y - chipH - gap;
+            if (chipY < 0) chipY = Math.min(box.y + gap, this.canvas.height - chipH);
+            let chipX = box.x;
+            if (chipX + chipW > this.canvas.width) chipX = Math.max(0, this.canvas.width - chipW);
 
-            // Draw text
-            this.ctx.fillStyle = '#ffffff';
-            this.ctx.textBaseline = 'middle';
-            this.ctx.fillText(labelText, box.x + 5, box.y - textHeight / 2 - 5);
+            // Two plants standing side by side put their chips at the same
+            // height and the labels overlap into an unreadable smear. Step
+            // this one down until it clears the ones already drawn (bounded,
+            // so a crowded frame degrades into slight overlap rather than a
+            // long search or a chip pushed off the bottom).
+            const hits = other => !(chipX + chipW <= other.x || other.x + other.w <= chipX ||
+                                    chipY + chipH <= other.y || other.y + other.h <= chipY);
+            for (let attempt = 0; attempt < 3 && placedChips.some(hits); attempt++) {
+                chipY = Math.min(chipY + chipH + 3 * u, this.canvas.height - chipH);
+            }
+            placedChips.push({ x: chipX, y: chipY, w: chipW, h: chipH });
 
-            // Draw corner markers for aesthetic
-            const cornerSize = 10;
-            this.ctx.strokeStyle = '#06b6d4';
-            this.ctx.lineWidth = 2;
+            ctx.beginPath();
+            if (typeof ctx.roundRect === 'function') {
+                ctx.roundRect(chipX, chipY, chipW, chipH, 5 * u);
+            } else {
+                ctx.rect(chipX, chipY, chipW, chipH);
+            }
+            ctx.fillStyle = 'rgba(4, 10, 14, 0.78)';
+            ctx.fill();
+            ctx.strokeStyle = accentDim;
+            ctx.lineWidth = 1 * u;
+            ctx.stroke();
 
-            // Top-left
-            this.ctx.strokeRect(box.x, box.y, cornerSize, cornerSize);
-            // Top-right
-            this.ctx.strokeRect(box.x + box.width - cornerSize, box.y, cornerSize, cornerSize);
-            // Bottom-left
-            this.ctx.strokeRect(box.x, box.y + box.height - cornerSize, cornerSize, cornerSize);
-            // Bottom-right
-            this.ctx.strokeRect(box.x + box.width - cornerSize, box.y + box.height - cornerSize, cornerSize, cornerSize);
+            ctx.fillStyle = accent;
+            ctx.fillText(labelText, chipX + padX, chipY + chipH / 2);
+            ctx.restore();
         });
 
         // NOTE: the diagnostics used to be painted onto this canvas, which meant
@@ -2054,9 +2137,12 @@ const UIManager = {
         let sig = String(detections.length) + ':';
         for (const d of detections) {
             const a = d.analysis;
+            // healthConfidence is in the signature because it is the number
+            // the card now prints - leave it out and a verdict whose displayed
+            // confidence moved would never be repainted.
             sig += a
                 ? `${a.uncertain ? 'U' : ''}${a.crop}${a.health}${a.condition}` +
-                  `${a.conditionConfidence.toFixed(2)};`
+                  `${a.healthConfidence.toFixed(2)};`
                 : '-;';
         }
         return sig;
@@ -2125,10 +2211,17 @@ const UIManager = {
     // shows a crop or a condition.
     healthMarkup(detections) {
         if (!PlantAnalyzer.available) {
-            const msg = PlantAnalyzer.status === 'error'
-                ? 'HEALTH MODEL NOT AVAILABLE'
-                : 'WAITING FOR HEALTH MODEL';
-            return `<div class="health-note health-note--muted">${msg}</div>`;
+            // One headline for the user either way - a missing model and a
+            // broken model are the same fact from where they are standing, and
+            // showing a made-up Healthy/Unhealthy instead would be worse than
+            // saying nothing. The second line says which it is, in plain words,
+            // because "not installed yet" and "failed to load" need different
+            // actions from whoever is running this.
+            const why = PlantAnalyzer.status === 'error'
+                ? 'The health model is installed but could not be loaded.'
+                : 'Add plant_health_classifier.tflite and class_names.json to the model folder.';
+            return `<div class="health-note health-note--muted">HEALTH MODEL NOT AVAILABLE</div>` +
+                   `<div class="health-note health-note--muted health-note--why">${why}</div>`;
         }
         if (!detections.length) {
             return `<div class="health-note">Waiting for plant detection\u2026</div>`;
@@ -2158,26 +2251,42 @@ const UIManager = {
 
         const e = v => this.esc(v);
         const unhealthy = a.health === 'Unhealthy';
-        // Headline confidence is the top-1 class probability - the model's
-        // actual prediction. Crop and health are marginalisations of that same
-        // distribution, so this is the number that stands behind the verdict.
-        const pct = `${Math.round(a.conditionConfidence * 100)}%`;
+
+        // HEALTHY / UNHEALTHY is the answer the user came for, so it is the
+        // headline and everything else is subordinate to it.
+        //
+        // The number beside it is healthConfidence - P(healthy) or
+        // P(unhealthy), the sum over the healthy or unhealthy classes. That is
+        // the confidence in the statement actually being made. The top-1 class
+        // probability (conditionConfidence) is a different, always-smaller
+        // number: the model can be 95% sure a plant is diseased while splitting
+        // that mass across three similar blights, and quoting 40% next to
+        // "UNHEALTHY" would understate a verdict it is in fact sure of.
+        const pct = `${Math.round(a.healthConfidence * 100)}%`;
+
+        // Condition only earns a row when it says something beyond the
+        // headline - "Condition: Healthy" under "HEALTHY" is noise.
+        const conditionRow = (unhealthy && a.condition &&
+                              a.condition.toLowerCase() !== 'healthy')
+            ? `<div class="health-row">
+                   <span class="health-key">Condition</span>
+                   <span class="health-val">${e(a.condition)}</span>
+               </div>`
+            : '';
+
         return `<div class="health-block">${label}
-            <div class="health-row">
-                <span class="health-key">Crop</span>
-                <span class="health-val">${e(a.crop)}</span>
-            </div>
-            <div class="health-row">
-                <span class="health-key">Health</span>
-                <span class="health-val ${unhealthy ? 'is-unhealthy' : 'is-healthy'}">${e(a.health)}</span>
-            </div>
-            <div class="health-row">
-                <span class="health-key">Condition</span>
-                <span class="health-val">${e(a.condition)}</span>
+            <div class="health-verdict ${unhealthy ? 'is-unhealthy' : 'is-healthy'}">
+                <span class="health-verdict-icon" aria-hidden="true">${unhealthy ? '⚠️' : '✅'}</span>
+                <span class="health-verdict-text">${unhealthy ? 'UNHEALTHY' : 'HEALTHY'}</span>
             </div>
             <div class="health-row">
                 <span class="health-key">Confidence</span>
                 <span class="health-val">${pct}</span>
+            </div>
+            ${conditionRow}
+            <div class="health-row">
+                <span class="health-key">Crop</span>
+                <span class="health-val">${e(a.crop)}</span>
             </div>
         </div>`;
     },

@@ -1,0 +1,166 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>fx check</title>
+<style>body{margin:0;font:12px monospace;background:#0b1219;color:#cbd5e1}#stage{position:absolute;left:-4000px;top:0}</style>
+</head><body>
+<pre id="log">running…</pre><div id="stage"></div>
+<!-- Holds the load event open so --screenshot / --dump-dom fire after the run
+     has finished, WITHOUT --virtual-time-budget: under virtual time rAF stalls,
+     getUserMedia never resolves and the camera half of this file can never
+     reach its running state. Needs _probe/serve.py (or any server with a
+     /slow?ms=N endpoint), not python -m http.server. -->
+<img src="/slow?ms=45000" alt="" width="1" height="1" style="opacity:0">
+<script>
+/* Verifies the INSTRUMENT LAYER is genuinely driven by the app's own state.
+   Everything it asserts is CSS reacting to DOM the pipeline already maintains
+   (button disabled flags, .summary-indicator.detected) via :has() - so this
+   also proves no JS was needed. Drives the real pipeline through the stubbed
+   models in ui_app.html and reads back computed styles + running animations.
+
+   It also re-checks that the decoration did not disturb the layout: page
+   height, horizontal overflow, and the four control buttons' geometry. */
+const W = +(new URLSearchParams(location.search).get('w') || 390);
+const H = +(new URLSearchParams(location.search).get('h') || 844);
+const out = [];
+const log = m => { document.getElementById('log').textContent += '\n' + m; };
+const wait = ms => new Promise(r => setTimeout(r, ms));
+let pass = 0, fail = 0;
+const check = (name, cond, detail) => {
+  (cond ? pass++ : fail++);
+  out.push((cond ? 'PASS  ' : 'FAIL  ') + name + (detail ? '   [' + detail + ']' : ''));
+};
+
+const until = async (fn, ms = 15000) => {
+  const t0 = performance.now();
+  while (performance.now() - t0 < ms) { if (fn()) return true; await wait(100); }
+  return false;
+};
+
+(async () => {
+  document.getElementById('log').textContent = '';
+  const f = document.createElement('iframe');
+  f.width = W; f.height = H; f.style.border = '0'; f.src = '/_probe/ui_app.html';
+  document.getElementById('stage').appendChild(f);
+  await new Promise(r => f.onload = r);
+  const win = f.contentWindow, doc = f.contentDocument;
+  const cs = sel => win.getComputedStyle(doc.querySelector(sel));
+  const anim = sel => {
+    const a = doc.querySelector(sel).getAnimations().filter(x => x.playState === 'running' || x.playState === 'finished');
+    return a.map(x => (x.animationName || (x.effect && x.effect.getKeyframes && 'css'))).join(',');
+  };
+  const names = sel => win.getComputedStyle(doc.querySelector(sel)).animationName;
+
+  await until(() => win.AGRIVISION && win.AGRIVISION.ui.state.modelReady);
+  await wait(1400);                       // let the load sequence finish
+
+  // ---- load sequence settles to a flat, fully opaque resting state --------
+  for (const sel of ['.camera-wrapper', '.panel--detection', '.panel--health', '#startCameraBtn']) {
+    const s = win.getComputedStyle(doc.querySelector(sel));
+    check('settles flat+opaque: ' + sel,
+      s.opacity === '1' && (s.transform === 'none' || s.transform === 'matrix(1, 0, 0, 1, 0, 0)'),
+      'opacity=' + s.opacity + ' transform=' + s.transform);
+  }
+
+  // ---- 0. at rest: no viewfinder, no sweep -------------------------------
+  check('idle: viewfinder hidden', cs('.viewfinder').opacity === '0', 'opacity=' + cs('.viewfinder').opacity);
+  check('idle: no scan sweep', names('.vf-scan') === 'none', names('.vf-scan'));
+  check('idle: no lock pulse', names('.vf-lock') === 'none', names('.vf-lock'));
+
+  // ---- 2. camera opens ----------------------------------------------------
+  doc.getElementById('startCameraBtn').click();
+  const camOn = await until(() => win.AGRIVISION.ui.state.cameraRunning);
+  check('camera reaches running state', camOn);
+  await wait(700);
+  check('camera on: viewfinder shown', cs('.viewfinder').opacity === '1', 'opacity=' + cs('.viewfinder').opacity);
+  check('camera on: corners drew in', names('.vf-corner--tl') === 'corner-draw', names('.vf-corner--tl'));
+  check('camera on: still no sweep (detection idle)', names('.vf-scan') === 'none', names('.vf-scan'));
+
+  // ---- 3. detection runs --------------------------------------------------
+  await until(() => !doc.getElementById('startDetectionBtn').disabled);
+  doc.getElementById('startDetectionBtn').click();
+  const detOn = await until(() => win.AGRIVISION.ui.state.detectionActive);
+  check('detection reaches active state', detOn);
+  await wait(300);
+  check('detecting: scan sweep running', names('.vf-scan') === 'scan-sweep', names('.vf-scan'));
+  // Under prefers-reduced-motion the global reset cuts every duration to
+  // 0.001ms, so the sweep does not loop - it lands on its final keyframe
+  // (opacity 0) and reports 'finished'. That IS the correct behaviour there,
+  // so accept it rather than calling honoured accessibility a failure.
+  const reduced = win.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const scanAnims = doc.querySelector('.vf-scan').getAnimations();
+  const scanState = scanAnims.map(a => a.playState).join(',');
+  // Reduced motion: the 0.001ms animation is over before this runs and is
+  // released, so getAnimations() is empty. Assert "not running" there, and
+  // "running" otherwise.
+  check('detecting: sweep ' + (reduced ? 'never loops (reduced motion)' : 'is actually playing'),
+        reduced ? !scanState.includes('running')
+                : (scanAnims.length > 0 && scanState === 'running'),
+        JSON.stringify(scanState));
+
+  // ---- 4. a plant is confirmed -------------------------------------------
+  win.__scenario = 'onePlant';
+  const found = await until(() => doc.getElementById('plantCountValue').textContent !== '0');
+  check('pipeline confirms the plant', found, 'count=' + doc.getElementById('plantCountValue').textContent);
+  await wait(700);            // let the 0.45s border-color transition land
+  check('detected: indicator carries .detected',
+        doc.querySelector('.summary-indicator').classList.contains('detected'));
+  check('detected: lock pulse fired', names('.vf-lock') === 'lock-on', names('.vf-lock'));
+  // green #34d399 vs cyan #22d3ee differ mainly in BLUE (153 vs 238), so read
+  // that channel rather than string-matching a colour still easing between them
+  const blue = sel => +(cs(sel).borderTopColor.match(/\d+/g) || [0,0,0])[2];
+  check('detected: corners turn green', blue('.vf-corner--tl') < 190, cs('.vf-corner--tl').borderTopColor);
+
+  // ---- back to zero -------------------------------------------------------
+  win.__scenario = 'personOnly';
+  const cleared = await until(() => doc.getElementById('plantCountValue').textContent === '0', 20000);
+  check('count returns to 0 on a person-only frame', cleared,
+        'count=' + doc.getElementById('plantCountValue').textContent);
+  await wait(700);
+  check('no plant: lock pulse withdrawn', names('.vf-lock') === 'none', names('.vf-lock'));
+  check('no plant: corners back to cyan', blue('.vf-corner--tl') > 200,
+        cs('.vf-corner--tl').borderTopColor);
+
+  // ---- stop detection -----------------------------------------------------
+  doc.getElementById('stopDetectionBtn').click();
+  await until(() => !win.AGRIVISION.ui.state.detectionActive);
+  await wait(200);
+  check('stopped: sweep stops', names('.vf-scan') === 'none', names('.vf-scan'));
+
+  // ---- the decoration must not touch layout -------------------------------
+  const de = doc.documentElement;
+  check('no horizontal overflow', de.scrollWidth - de.clientWidth <= 0, 'diff=' + (de.scrollWidth - de.clientWidth));
+  const btns = ['startCameraBtn', 'stopCameraBtn', 'startDetectionBtn', 'stopDetectionBtn']
+    .map(id => doc.getElementById(id).getBoundingClientRect());
+  check('buttons keep their 40px touch target', btns.every(b => b.height >= 40),
+        btns.map(b => b.height).join(','));
+  // 2 x 2 on phones and narrow desktops, one row from 1240px up - assert
+  // whichever layout this viewport is actually in.
+  const twoByTwo = btns[0].top !== btns[2].top;
+  check('buttons stay aligned (' + (twoByTwo ? '2x2' : 'one row') + ')',
+        twoByTwo
+          ? (btns[0].top === btns[1].top && btns[2].top === btns[3].top &&
+             btns[0].left === btns[2].left && btns[1].left === btns[3].left)
+          : (new Set(btns.map(b => b.top)).size === 1 &&
+             new Set(btns.map(b => b.height)).size === 1));
+  check('viewfinder never takes pointer events', cs('.viewfinder').pointerEvents === 'none');
+
+  // Each corner must be an L, not a closed box - two borders on, two off.
+  const corners = { '--tl': ['Top', 'Left'], '--tr': ['Top', 'Right'],
+                    '--bl': ['Bottom', 'Left'], '--br': ['Bottom', 'Right'] };
+  for (const [suffix, on] of Object.entries(corners)) {
+    const c = cs('.vf-corner' + suffix);
+    const w = side => c['border' + side + 'Width'];
+    const off = ['Top', 'Right', 'Bottom', 'Left'].filter(x => !on.includes(x));
+    check('corner ' + suffix + ' is an L-bracket',
+          on.every(x => w(x) === '2px') && off.every(x => w(x) === '0px'),
+          ['Top','Right','Bottom','Left'].map(x => x[0] + w(x)).join(' '));
+  }
+
+  const t = doc.querySelector('.panel--detection .panel-title');
+  check('panel title text unchanged', t.textContent.trim() === 'PLANT DETECTION', JSON.stringify(t.textContent.trim()));
+  check('drawn marks present', !!doc.querySelector('.logo-mark') && doc.querySelectorAll('.panel-ico').length === 2
+        && !!doc.querySelector('.leaf-watermark'));
+
+  log(out.join('\n'));
+  log('\n' + W + 'x' + H + '   pass=' + pass + '  fail=' + fail + '  pageHeight=' + de.scrollHeight);
+  document.title = fail ? 'FAIL' : 'DONE';
+})();
+</script></body></html>

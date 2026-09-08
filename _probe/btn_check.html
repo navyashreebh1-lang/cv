@@ -1,0 +1,94 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>btn check</title>
+<style>body{margin:0;font:12px monospace}#stage{position:absolute;left:-4000px;top:0}</style>
+</head><body>
+<pre id="log">running…</pre><div id="stage"></div>
+<script>
+/* Button-geometry audit for the four camera/detection controls.
+   Loads the REAL stylesheet + real markup (via /_probe/ui_app.html, whose
+   controls block is byte-identical to index.html's) at each viewport and
+   reports, per button: box, computed padding/font/icon size, whether the label
+   is clipped, how many lines it wraps to, plus grid alignment, overlap and
+   horizontal overflow for the page as a whole. Layout-only - no camera, no
+   model, no clicking, so nothing here depends on the detection pipeline. */
+const IDS = ['startCameraBtn','stopCameraBtn','startDetectionBtn','stopDetectionBtn'];
+const VIEWPORTS = [[375,667],[390,844],[412,915],[360,740],[320,568],[768,1024],[1024,768],[1025,800],[1100,800],[1239,800],[1240,800],[1366,768],[1440,900],[1920,1080]];
+const r2 = n => +n.toFixed(1);
+const log = m => { document.getElementById('log').textContent += '\n' + m; };
+
+(async () => {
+  document.getElementById('log').textContent = '';
+  const out = [];
+  for (const [W,H] of VIEWPORTS) {
+    const f = document.createElement('iframe');
+    f.width = W; f.height = H; f.style.border = '0'; f.src = '/_probe/ui_app.html';
+    document.getElementById('stage').appendChild(f);
+    await new Promise(r => f.onload = r);
+    // The page has a one-off entrance sequence (~1.05s). Measuring during it
+    // reports mid-animation boxes - fractional heights, a stagger that looks
+    // like a broken row, and transient overflow. Wait for every control to be
+    // back at transform:none before reading any geometry.
+    // Give the animations time to START before testing whether they finished -
+    // immediately after onload the computed transform can still read 'none'
+    // (nothing has begun), which would pass the settle test and then measure
+    // mid-flight a moment later.
+    await new Promise(r => setTimeout(r, 1500));
+    const settled = () => [...f.contentDocument.querySelectorAll('.camera-controls .btn, .panel')]
+      .every(el => { const t = f.contentWindow.getComputedStyle(el).transform;
+                     return t === 'none' || t === 'matrix(1, 0, 0, 1, 0, 0)'; });
+    for (let i = 0; i < 60 && !settled(); i++) await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 150));
+    const win = f.contentWindow, doc = f.contentDocument;
+    const cs = el => win.getComputedStyle(el);
+    const btns = IDS.map(id => doc.getElementById(id));
+    const rows = btns.map(b => {
+      const rect = b.getBoundingClientRect();
+      const s = cs(b);
+      const txt = b.querySelector('.btn-text'), ico = b.querySelector('.btn-icon');
+      const tr = txt.getBoundingClientRect();
+      const lh = parseFloat(cs(txt).lineHeight) || parseFloat(s.fontSize) * 1.2;
+      return {
+        id: b.id,
+        x: r2(rect.left), y: r2(rect.top), w: r2(rect.width), h: r2(rect.height),
+        padY: s.paddingTop + '/' + s.paddingBottom, padX: s.paddingLeft + '/' + s.paddingRight,
+        font: s.fontSize, icon: cs(ico).fontSize, gap: s.gap, minH: s.minHeight,
+        lines: Math.max(1, Math.round(tr.height / lh)),
+        // how much room the label has left before it is forced to wrap
+        slack: r2(rect.width - (tr.width + ico.getBoundingClientRect().width
+               + parseFloat(s.columnGap || s.gap || 0)
+               + parseFloat(s.paddingLeft) + parseFloat(s.paddingRight)
+               + parseFloat(s.borderLeftWidth) + parseFloat(s.borderRightWidth))),
+        // clipped = the label's own content is wider/taller than the box it got
+        clipX: txt.scrollWidth - txt.clientWidth > 1,
+        textOverflowsBtn: r2(tr.right - rect.right) > 0.5 || r2(rect.left - tr.left) > 0.5
+      };
+    });
+    // alignment: 2x2 grid on phones, one flex row on >=768
+    const twoByTwo = rows[0].y !== rows[2].y;
+    const align = twoByTwo
+      ? { rowsMatchY: rows[0].y === rows[1].y && rows[2].y === rows[3].y,
+          rowsMatchH: rows[0].h === rows[1].h && rows[2].h === rows[3].h,
+          colsMatchX: rows[0].x === rows[2].x && rows[1].x === rows[3].x,
+          colsMatchW: rows[0].w === rows[2].w && rows[1].w === rows[3].w }
+      : { sameY: new Set(rows.map(r => r.y)).size === 1,
+          sameH: new Set(rows.map(r => r.h)).size === 1 };
+    // overlap
+    let overlap = false;
+    for (let i=0;i<4;i++) for (let j=i+1;j<4;j++) {
+      const a = rows[i], b = rows[j];
+      if (a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h) overlap = true;
+    }
+    const de = doc.documentElement;
+    out.push({
+      viewport: W + 'x' + H,
+      layout: twoByTwo ? '2x2' : 'row',
+      controlsH: r2(doc.querySelector('.camera-controls').getBoundingClientRect().height),
+      hOverflow: de.scrollWidth - de.clientWidth,
+      pageH: de.scrollHeight,
+      overlap, align, buttons: rows
+    });
+    f.remove();
+  }
+  log(JSON.stringify(out, null, 1));
+  document.title = 'DONE';
+})();
+</script></body></html>

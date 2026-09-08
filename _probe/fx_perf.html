@@ -1,0 +1,88 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>fx perf</title>
+<style>body{margin:0;font:12px monospace;background:#0b1219;color:#cbd5e1}#stage{position:absolute;left:-4000px;top:0}</style>
+</head><body>
+<pre id="log">running…</pre><div id="stage"></div>
+<!-- Load-event hold: this must run on real time, not --virtual-time-budget. -->
+<img src="/slow?ms=120000" alt="" width="1" height="1" style="opacity:0">
+<script>
+/* What does the instrument layer COST?
+
+   The app's own history is that a UI change can quietly eat the main thread
+   (see the perf pass: more inference FPS made felt lag worse). So measure the
+   added decoration the same way: run the real pipeline through the stubs with
+   the scan sweep ON, then again with `.vf-scan { animation: none }` injected -
+   identical build, identical detect rate, one difference - and compare rAF
+   deltas. Runs alternate and are medianed, because run-to-run variance on this
+   app is large. */
+const q = new URLSearchParams(location.search);
+const RUNS = +(q.get('runs') || 3), SECS = +(q.get('secs') || 8);
+const log = m => { document.getElementById('log').textContent += '\n' + m; };
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const until = async (fn, ms = 20000) => { const t0 = performance.now();
+  while (performance.now() - t0 < ms) { if (fn()) return true; await wait(100); } return false; };
+const median = a => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+
+async function run(sweep) {
+  const f = document.createElement('iframe');
+  f.width = 390; f.height = 844; f.style.border = '0'; f.src = '/_probe/ui_app.html';
+  document.getElementById('stage').appendChild(f);
+  await new Promise(r => f.onload = r);
+  const win = f.contentWindow, doc = f.contentDocument;
+  if (!sweep) {
+    const st = doc.createElement('style');
+    st.textContent = '.vf-scan{animation:none !important}';
+    doc.head.appendChild(st);
+  }
+  await until(() => win.AGRIVISION && win.AGRIVISION.ui.state.modelReady);
+  doc.getElementById('startCameraBtn').click();
+  await until(() => win.AGRIVISION.ui.state.cameraRunning);
+  await until(() => !doc.getElementById('startDetectionBtn').disabled);
+  doc.getElementById('startDetectionBtn').click();
+  win.__scenario = 'twoPlants';
+  await until(() => win.AGRIVISION.ui.state.detectionActive);
+  await wait(1500);                                  // settle
+
+  const deltas = [];
+  let last = performance.now();
+  const t0 = last, d0 = win.__detects;
+  await new Promise(done => {
+    const tick = now => {
+      deltas.push(now - last); last = now;
+      if (now - t0 < SECS * 1000) win.requestAnimationFrame(tick); else done();
+    };
+    win.requestAnimationFrame(tick);
+  });
+  const dur = (performance.now() - t0) / 1000;
+  const detects = win.__detects - d0;
+  f.remove();
+  const s = [...deltas].sort((a, b) => a - b);
+  return {
+    fps: +(deltas.length / dur).toFixed(1),
+    p50: +s[Math.floor(s.length * 0.5)].toFixed(1),
+    p90: +s[Math.floor(s.length * 0.9)].toFixed(1),
+    p99: +s[Math.floor(s.length * 0.99)].toFixed(1),
+    jank: +(100 * deltas.filter(d => d > 33).length / deltas.length).toFixed(1),
+    freezes: deltas.filter(d => d > 100).length,
+    detectsPerSec: +(detects / dur).toFixed(1)
+  };
+}
+
+(async () => {
+  document.getElementById('log').textContent = '';
+  const on = [], off = [];
+  for (let i = 0; i < RUNS; i++) {          // alternate, so drift hits both
+    on.push(await run(true));
+    off.push(await run(false));
+    log('run ' + (i + 1) + '  sweep on ' + JSON.stringify(on[i]) + '\n       sweep off ' + JSON.stringify(off[i]));
+  }
+  const sum = rs => ({
+    fps: median(rs.map(r => r.fps)), p90: median(rs.map(r => r.p90)),
+    p99: median(rs.map(r => r.p99)), jank: median(rs.map(r => r.jank)),
+    freezes: median(rs.map(r => r.freezes)), detectsPerSec: median(rs.map(r => r.detectsPerSec))
+  });
+  log('\nMEDIAN of ' + RUNS);
+  log('  sweep ON   ' + JSON.stringify(sum(on)));
+  log('  sweep OFF  ' + JSON.stringify(sum(off)));
+  document.title = 'DONE';
+})();
+</script></body></html>
