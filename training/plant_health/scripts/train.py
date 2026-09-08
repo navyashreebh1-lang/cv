@@ -68,7 +68,34 @@ def build_augmenter():
                                           fill_mode="reflect"),
         tf.keras.layers.RandomContrast(a["contrast"]),
         tf.keras.layers.RandomBrightness(a["brightness"], value_range=(0, 255)),
-        tf.keras.layers.GaussianNoise(a["gaussian_noise_stddev"]),
+    ]
+
+    # Sensor noise, applied in [0,1] and scaled straight back to 0-255.
+    #
+    # This augmenter runs on RAW 0-255 pixels: image_dataset_from_directory()
+    # does no rescaling, the RandomBrightness above declares value_range=(0,255),
+    # and normalisation happens later inside MobileNetV3 (include_preprocessing).
+    # config.AUG["gaussian_noise_stddev"] = 4.0 is therefore 4 grey levels out
+    # of 255 - mild sensor noise, which is the intended strength.
+    #
+    # Keras 3 rejects GaussianNoise(stddev > 1) because it assumes normalised
+    # inputs. Passing 4/255 directly to a 0-255 tensor would apply ~250x too
+    # little noise and quietly disable the augmentation, so instead the noise is
+    # applied where Keras expects it and immediately scaled back:
+    #
+    #     (x/255 + N(0, 4/255)) * 255  ==  x + N(0, 4)
+    #
+    # identical to the original in both mean and standard deviation. The two
+    # Rescaling layers are exact inverses, GaussianNoise is a no-op at inference,
+    # so the model still consumes and forwards raw 0-255 exactly as
+    # class_names.json promises the browser. Rescaling is a plain built-in layer
+    # (a MUL in TFLite) - no custom objects, so load_model() in evaluate.py and
+    # export_tflite.py keeps working untouched.
+    stddev_01 = a["gaussian_noise_stddev"] / 255.0
+    layers += [
+        tf.keras.layers.Rescaling(1.0 / 255.0),
+        tf.keras.layers.GaussianNoise(stddev_01),
+        tf.keras.layers.Rescaling(255.0),
     ]
     return tf.keras.Sequential(layers, name="augment")
 
