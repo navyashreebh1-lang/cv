@@ -100,25 +100,40 @@ function withTimeout(promise, ms, label) {
 // pipeline. Tuned for the rule "one physical plant = one detection".
 const DETECTION_CONFIG = {
     // Which detector to try FIRST ('coco-ssd' | 'custom'); the other is the
-    // fallback. Default is 'coco-ssd' deliberately.
+    // fallback.
     //
-    // The shipped model/plant_detector.tflite is a single-class ("plant")
-    // YOLOv8n trained on an Open Images slice in which EVERY image contains a
-    // plant - it never saw a background/negative image, and Fruit/Flower/
-    // Flowerpot were merged into `plant`. The result is that it reports plants
-    // on a person-only frame at >90% confidence. Its inference path here is
-    // correct (verified op-by-op against the .tflite flatbuffer); the model
-    // itself is the defect.
+    // 'coco-ssd' was the default while Model 2 did not exist, because COCO-SSD
+    // is trained on all 80 COCO classes, so `person`, `chair`, `bottle` etc.
+    // are learned as their own classes and get rejected by CLASS VALIDATION
+    // below - the negative signal the custom model lacks.
     //
-    // COCO-SSD is trained on all 80 COCO classes, so `person`, `chair`,
-    // `bottle`, `laptop`, `dining table`, `tv` etc. are learned as their own
-    // classes and get rejected by CLASS VALIDATION below - which is exactly the
-    // negative signal the custom model lacks. Until the retrain lands (see
-    // training/train_plant_detector.ipynb), this is the engine that satisfies
-    // "person only -> 0 plants".
+    // It cannot be the default any more. COCO's ONLY plant class is `potted
+    // plant`, which is trained on unoccluded whole houseplants. On the crops
+    // this app exists to analyse it does not emit a plant class at all -
+    // measured on real photos at the 0.10 observation floor:
+    //     tomato plant  -> apple 83.3%, orange 15.3%   (no plant class)
+    //     ZZ houseplant -> vase 67.2%                  (`vase` is deliberately
+    //                                                   NOT a plant class)
+    //     basil plant   -> nothing at all
+    // Every one of those is dropped by class validation, so the count is 0, the
+    // "NO PLANT DETECTED" popup never clears, and Model 2 - which only ever
+    // runs on a CONFIRMED plant box - is never reached. That is a dead
+    // pipeline, not a strict one.
     //
-    // Switch to 'custom' after installing a retrained plant_detector.tflite.
-    engine: 'coco-ssd',
+    // The custom detector is the model actually trained for this job and it
+    // works: same three photos -> plant 92.6% / 82.4% / 83.7%, one box each,
+    // correctly placed. Its inference path is verified op-by-op against the
+    // .tflite flatbuffer (NCHW [1,3,640,640] in, [1,5,8400] out, normalised
+    // box coords).
+    //
+    // KNOWN COST, measured, not hypothetical: it never saw a background/
+    // negative image in training, so it also reports `plant 57.4%` on a
+    // person-only frame. That clears both scoreThreshold.custom (0.40) and
+    // temporal.instantConfirmScore (0.55), so a person alone CAN read as one
+    // plant. The honest fixes are a retrain with negatives (see
+    // training/train_plant_detector.ipynb) or raising scoreThreshold.custom -
+    // NOT reverting to an engine that detects nothing.
+    engine: 'custom',
 
     // COCO-SSD base network. The library default is 'lite_mobilenet_v2' (17MB),
     // which is the SPEED variant and the weakest of the three - SSD is already
@@ -2269,8 +2284,8 @@ const UIManager = {
         const conditionRow = (unhealthy && a.condition &&
                               a.condition.toLowerCase() !== 'healthy')
             ? `<div class="health-row">
-                   <span class="health-key">Condition</span>
-                   <span class="health-val">${e(a.condition)}</span>
+                   <span class="health-key">Likely Problem</span>
+                   <span class="health-val">${e(a.condition)} (${Math.round(a.conditionConfidence * 100)}%)</span>
                </div>`
             : '';
 

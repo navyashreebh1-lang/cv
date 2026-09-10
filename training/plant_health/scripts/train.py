@@ -139,7 +139,7 @@ def build_datasets():
         weights=[1.0 - mix, mix],
         seed=C.SEED,
         stop_on_empty_dataset=False,
-    ).batch(C.BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    ).batch(C.BATCH_SIZE).prefetch(1)
     steps = math.ceil(n_lab_train / C.BATCH_SIZE)
     print(f"[train] domain mix {1 - mix:.0%} lab / {mix:.0%} field, "
           f"{steps} steps per epoch")
@@ -155,16 +155,16 @@ def build_datasets():
         n_lab_keep = int(round(n_field_val * (1 - share) / max(share, 1e-6)))
         n_lab_keep = max(1, min(n_lab_keep, n_lab_val))
         lab_val_part = (lab_val.unbatch()
-                        .shuffle(min(n_lab_val, 10000), seed=C.SEED,
+                        .shuffle(n_lab_keep, seed=C.SEED,
                                  reshuffle_each_iteration=False)
                         .take(n_lab_keep))
         val_ds = (lab_val_part.concatenate(field_val.unbatch())
-                  .batch(C.BATCH_SIZE).prefetch(tf.data.AUTOTUNE))
+                  .batch(C.BATCH_SIZE).prefetch(1))
         print(f"[train] validation blend: {n_lab_keep:,} lab + {n_field_val:,} field")
     else:
         print("[train] WARNING: no field/val split - validating on lab images only, "
               "which will select a lab-specialised checkpoint.")
-        val_ds = lab_val.prefetch(tf.data.AUTOTUNE)
+        val_ds = lab_val.prefetch(1)
         n_field_val = 0
 
     return (train_ds, val_ds, class_names, steps,

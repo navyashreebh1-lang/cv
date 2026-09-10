@@ -107,7 +107,9 @@ def _make_interpreter(tflite_bytes: bytes):
 
 def convert(model, class_names, int8: bool) -> bytes:
     converter = _make_converter(model)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    if int8:
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
     if int8:
         converter.representative_dataset = representative_dataset(class_names)
         # Keep float I/O: tfjs-tflite in the browser feeds/reads float tensors,
@@ -168,7 +170,17 @@ def main() -> None:
     meta = json.loads(meta_path.read_text())
     class_names = meta["class_names"]
 
-    model = tf.keras.models.load_model(args.model)
+    model = tf.keras.models.load_model(args.model, compile=False)
+    base = model.layers[2]
+    gap = model.layers[3]
+    dropout = model.layers[4]
+    dense = model.layers[5]
+    inputs = tf.keras.Input(shape=C.IMG_SHAPE, name="image")
+    x = base(inputs, training=False)
+    x = gap(x)
+    x = dropout(x, training=False)
+    outputs = dense(x)
+    model = tf.keras.Model(inputs, outputs, name="export_model")
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"[export] converting {args.model} (int8={args.int8})...")
