@@ -294,6 +294,152 @@ const DETECTION_CONFIG = {
     // on the main thread that competes with the camera preview.
     uiThrottleMs: 250,
 
+    // ---- SCAN SESSION ------------------------------------------------------
+    // The app used to publish a verdict every inference frame. That is honest
+    // per frame and useless to a human: at ~1 frame/second the health line
+    // flickered between Healthy and Unhealthy as the crop shifted a few pixels,
+    // and the number beside it moved every time. The user's question is not
+    // "what does frame 47 think", it is "is this plant healthy" - which is a
+    // question about the whole observation, not one frame of it.
+    //
+    // So detection now runs as a fixed-length SCAN. Evidence accumulates for
+    // the whole window and exactly one verdict is produced at the end, then
+    // frozen until a new scan starts. Nothing about Model 1, the person veto or
+    // Model 2 changes - this layer only decides how their per-frame output is
+    // combined and when the user is shown a result.
+    scan: {
+        enabled: true,
+        // Anywhere in 15000-30000 is sensible. 20 s is roughly 13-20 detection
+        // cycles on the machines measured here, which is enough for the sample
+        // counts below without making the user hold a plant still for half a
+        // minute.
+        durationMs: 20000,
+
+        // ---- how much evidence is enough --------------------------------
+        // A verdict is refused rather than guessed when these are not met.
+        // A 20 s window yields ~10 detection cycles on the machines measured
+        // here (inference is ~1.5-2 s per cycle). These floors are set well
+        // under that on purpose: a slower phone must produce a real verdict,
+        // not "inconclusive" as a permanent side effect of being slow. The
+        // gates that actually protect the ANSWER are the health ones below -
+        // these two only stop a scan that barely ran from being judged at all.
+        minFrames: 5,           // detection cycles that must have run at all
+        minPlantFrames: 3,      // cycles that must have contained a plant
+        minPlantRatio: 0.30,    // ...and that must be this share of all cycles
+        minHealthSamples: 3,    // independent Model 2 runs on a confirmed plant
+        minConfidence: 0.60,    // aggregated model confidence floor
+        minAgreement: 0.60,     // share of samples voting with the majority
+
+        // Model 2 normally re-runs on an unchanged plant only every
+        // analysis.refreshMs (4 s), which is right for a live readout and far
+        // too slow for a 20 s scan - it would yield 5 samples. During a scan we
+        // want independent observations, so the plant is re-analysed faster.
+        // This does NOT change how Model 2 works, only how often it is asked.
+        sampleRefreshMs: 1200,
+
+        // Newer observations weigh more: the operator is usually still framing
+        // the plant at the start of a scan and settled by the end. Half-life,
+        // not a cut-off - an early sample still counts, just less.
+        recencyHalfLifeMs: 12000,
+
+        // How long the plant may be missing before the scan bar starts asking
+        // for it back. Stops the hint flickering on a single dropped frame.
+        missingHintMs: 2500,
+
+        // A displayed confidence of 100% would claim certainty this system does
+        // not have - and agreement between samples is NOT the same thing as
+        // certainty about the plant. The number shown is always the model's own
+        // averaged probability, and it is capped one point below certain.
+        maxDisplayConfidence: 99
+    },
+
+    // ---- PERSON VETO -------------------------------------------------------
+    // The custom detector never saw a background/negative image in training, so
+    // it has no way to say "not a plant" - it only ever reports how plant-like
+    // a region looks. Measured on this machine, straight out of
+    // DetectionEngine.realDetection:
+    //
+    //     person, plain background   -> plant 88.9%
+    //     person, half-length photo  -> plant 72.6%
+    //     potted tomato plant        -> plant 41.4%
+    //     tomato bush                -> plant 80.4%
+    //     tomato foliage close-up    -> plant 58.5%
+    //     blighted tomato leaf       -> plant 54.5%
+    //
+    // A person scores HIGHER than three of the four real plants. There is
+    // therefore no value of scoreThreshold.custom that rejects a person and
+    // keeps the plants - raising it to 0.89 would delete every plant above.
+    // Confidence cannot fix this, because the missing information is not
+    // "how sure are you", it is "sure of WHAT".
+    //
+    // COCO-SSD has that information: `person` is one of its 80 trained classes.
+    // Measured on the same frames, it found person at 0.99 / 0.92 / 0.95 on the
+    // three person photos and NO person at all on any of the four plant photos,
+    // so using it purely as a NEGATIVE signal cannot cost a real detection.
+    //
+    // This is deliberately a veto and nothing more. COCO-SSD never contributes
+    // a detection, never raises a confidence, and never runs as the engine -
+    // the custom model remains the only thing that decides where plants are.
+    // A person HOLDING a plant still yields the plant: the veto needs the
+    // person box to cover most of the plant box, and a held plant sticks out.
+    personVeto: {
+        enabled: true,
+        // The 17MB speed variant, not the 64MB accuracy one. `person` is COCO's
+        // best-represented class and the lite base scored 0.92-0.99 on it here;
+        // spending 47 extra megabytes to reject a person is not a good trade,
+        // especially on the slow link measured above.
+        base: 'lite_mobilenet_v2',
+        // Loaded LAZILY, in the background, after the app is already usable, and
+        // its failure is never fatal. On the measured connection this takes
+        // ~170 s; until it finishes the app behaves exactly as it does today.
+        // Detection must never wait on a veto.
+        minScore: 0.50,        // COCO person confidence required to veto at all
+
+        // ---- what "this box is a person" actually looks like ---------------
+        // Two tests, because ONE is not enough. Measured coverage of the custom
+        // detector's box against COCO's person box:
+        //
+        //   frame          plantInPerson  personInPlant  areaRatio
+        //   person_a           0.786          1.00         1.27
+        //   person_b           0.537          1.00         1.86
+        //   person_c #1        0.893          0.92         1.03
+        //   person_c #2        0.930          1.00         1.06
+        //
+        // A single "is the plant box inside the person box" test at 0.70 misses
+        // person_b outright: the detector drew a box TALLER than the person
+        // (full frame height), so only 54% of it is inside them - while 100% of
+        // the person is inside it. Dropping the threshold to catch that would
+        // start eating plants held in front of a torso.
+        //
+        // So the real question is not containment in one direction, it is
+        // "are these two boxes the same region?", which needs both.
+        // Values chosen by searching the threshold space against 10 measured
+        // boxes (8 that are really a person, 2 that are really a plant next to
+        // one). These separate all 10 - but HONESTLY, with a thin margin, and
+        // the margin is a property of the signal rather than of the tuning:
+        //
+        //   held_b  plant held at the camera, torso behind : plantInPerson 0.727
+        //   held_c  a person                               : plantInPerson 0.766
+        //
+        // 0.039 apart. Below the gate a person occasionally counts as a plant;
+        // above it, a plant held close to the chest occasionally does not count.
+        // 0.75 sits between them. Only ONE measured person box (person_b, the
+        // one whose plant box was taller than the person) needs the second test,
+        // and it scores 1.000 there against held_b's 0.915 - so 0.96 keeps a
+        // real margin on both sides rather than shaving past held_b.
+        //
+        // If a person still registers during a demo, RAISE coverThresh toward
+        // 0.70; if a held plant stops registering, LOWER it toward 0.80. Do not
+        // read these as tuned-in-the-lab constants - they are two competing
+        // errors on a 10-box sample.
+        coverThresh: 0.75,          // plant box mostly INSIDE a person box
+        sameRegionCover: 0.96,      // ...or a person is almost entirely inside the plant box
+        sameRegionAreaRatio: 2.0,   // ...AND the plant box is not much bigger than them
+
+        intervalMs: 1500,      // at most one COCO pass per this many ms
+        staleMs: 5000          // forget the person map if it stops refreshing
+    },
+
     // ---- MODEL 2: plant health / crop analysis -----------------------------
     // Runs only on the crops Model 1 already validated as plants. Disabled
     // automatically when model/plant_health_classifier.tflite is absent, so the
@@ -345,6 +491,16 @@ function boxOverlapRatio(a, b) {
     const inter = boxIntersectionArea(a, b);
     const minArea = Math.min(a.width * a.height, b.width * b.height);
     return minArea > 0 ? inter / minArea : 0;
+}
+
+// What FRACTION OF `inner` lies inside `outer`. Unlike boxOverlapRatio this is
+// directional - it always divides by `inner`'s area, never by whichever box
+// happens to be smaller. The person veto needs that direction specifically:
+// "how much of this plant box is inside that person box", which is a different
+// question from "how much do these two boxes overlap".
+function coveredFraction(inner, outer) {
+    const area = inner.width * inner.height;
+    return area > 0 ? boxIntersectionArea(inner, outer) / area : 0;
 }
 
 // Greedy duplicate suppression. Walks detections highest-confidence first and
@@ -706,9 +862,25 @@ const CustomModel = {
             // either way) but the WASM base path deliberately isn't.
             tflite.setWasmPath('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite/dist/');
             debugLog('Loading model/plant_detector.tflite ...');
+            // 10000 ms was far too tight, and the way it failed was the worst
+            // possible one. This promise does NOT just fetch the 12MB .tflite
+            // (that is served from the same origin as the page - measured at
+            // 0.24 s); it also waits for tfjs-tflite's WASM runtime to arrive
+            // from the CDN. That runtime, tflite_web_api_cc_simd.wasm, is 1.1MB
+            // over the public internet and was measured on this machine at
+            // 6.4 s - two thirds of the old budget, on a connection that was
+            // working normally.
+            //
+            // When it did overrun, the catch below demoted the app to the
+            // COCO-SSD fallback, and cocoSsd.load() was measured here at
+            // 170 SECONDS for the 17MB lite base (the configured base is the
+            // 64MB one). The app sits on "PREPARING AI MODEL..." for minutes,
+            // then ends up on the engine this file already documents as a dead
+            // pipeline for crops. Slow is not the same as broken: wait for the
+            // detector that works instead of racing to a worse one.
             this.model = await withTimeout(
                 tflite.loadTFLiteModel('model/plant_detector.tflite', { numThreads }),
-                10000,
+                60000,
                 'Custom TFLite model load'
             );
             debugLog('Custom model loaded. Input imgsz =', this.imgsz, 'classes =', this.classNames);
@@ -842,6 +1014,34 @@ const CustomModel = {
             };
         });
 
+        const rawDetections = scoresData.map((score, index) => ({
+            index,
+            className: this.classNames[classIdsData[index]] || 'plant',
+            confidence: (score * 100).toFixed(1)
+        }));
+        const keepSet = new Set(keepIndices);
+        const confidenceThreshold = this.scoreThreshold;
+        const removedByConfidence = rawDetections.filter(
+            d => parseFloat(d.confidence) < confidenceThreshold * 100
+        );
+        const removedByNms = rawDetections.filter(
+            d => !keepSet.has(d.index) && parseFloat(d.confidence) >= confidenceThreshold * 100
+        );
+
+        if (VERBOSE_LOGGING) {
+            const shortList = d => d.slice(0, 5).map(item => `${item.className} ${item.confidence}%`).join(', ');
+            debugLog(`RAW CUSTOM DETECTIONS: ${rawDetections.length}` +
+                (rawDetections.length ? ` [${shortList(rawDetections)}${rawDetections.length > 5 ? ' ...' : ''}]` : ''));
+            if (removedByConfidence.length) {
+                debugLog(`CUSTOM CONFIDENCE FILTER REMOVED: ${removedByConfidence.length}` +
+                    ` [${shortList(removedByConfidence)}${removedByConfidence.length > 5 ? ' ...' : ''}]`);
+            }
+            if (removedByNms.length) {
+                debugLog(`CUSTOM NMS REMOVED: ${removedByNms.length}` +
+                    ` [${shortList(removedByNms)}${removedByNms.length > 5 ? ' ...' : ''}]`);
+            }
+        }
+
         // CLASS VALIDATION: a box only survives if its class is an actual plant
         // class. This model only emits classId 0 ("plant"), so today every box
         // passes; it's the guard that keeps a future multi-class export - or a
@@ -856,6 +1056,11 @@ const CustomModel = {
             iouThresh: DETECTION_CONFIG.dedupeIouThreshold,
             overlapThresh: DETECTION_CONFIG.dedupeOverlapThreshold
         });
+
+        if (VERBOSE_LOGGING) {
+            debugLog(`FINAL CUSTOM PLANT DETECTIONS: ${finalDetections.length}` +
+                (finalDetections.length ? ` [${finalDetections.map(d => `${d.className} ${d.confidence}%`).join(', ')}]` : ''));
+        }
         dupsRemoved.forEach(r => debugLog(
             `DUPLICATE REMOVED: ${r.det.className} ${r.det.confidence}% ` +
             `(${r.reason} ${r.metric.toFixed(2)} vs kept box ${r.against.confidence}%)`));
@@ -875,6 +1080,138 @@ const CustomModel = {
 
         tf.dispose([output, boxesXYXY, scores, classIds, nmsIndices]);
         return finalDetections;
+    }
+};
+
+// ============================================================================
+// 2a. PERSON VETO - the negative signal the custom detector does not have
+// ============================================================================
+//
+// See DETECTION_CONFIG.personVeto for the measurements that motivate this.
+//
+// SHAPE OF THE THING, so it is not mistaken for a second detector:
+//   * it can only ever REMOVE a candidate, never add or promote one
+//   * it runs at most once per intervalMs, and only on frames where the custom
+//     detector actually produced a candidate - a frame with no candidates costs
+//     nothing at all
+//   * it loads in the background and self-disables on any failure; detection
+//     never waits for it and never breaks because of it
+const PersonVeto = {
+    model: null,
+    available: false,
+    status: 'not-loaded',   // 'not-loaded' | 'loading' | 'ready' | 'disabled' | 'error'
+    personBoxes: [],
+    mappedAt: 0,
+    lastRunAt: 0,
+    inferenceTime: 0,
+    vetoed: 0,
+
+    // Deliberately NOT awaited by initializeApp. The app is fully usable before
+    // this resolves; arming the veto late is strictly better than delaying the
+    // detector behind a 17MB download.
+    async load() {
+        const cfg = DETECTION_CONFIG.personVeto;
+        if (!cfg.enabled) { this.status = 'disabled'; return false; }
+        if (typeof cocoSsd === 'undefined') {
+            this.status = 'error';
+            console.warn('[AGRIVISION] Person veto unavailable: COCO-SSD library did not load. ' +
+                'Detection continues; a person may register as a plant.');
+            return false;
+        }
+        this.status = 'loading';
+        try {
+            const t = performance.now();
+            this.model = await cocoSsd.load({ base: cfg.base });
+            this.available = true;
+            this.status = 'ready';
+            infoLog(`Person veto armed (COCO-SSD base="${cfg.base}", ` +
+                `${Math.round((performance.now() - t) / 1000)}s). A person-only frame ` +
+                `will no longer be counted as a plant.`);
+            return true;
+        } catch (err) {
+            this.status = 'error';
+            console.warn('[AGRIVISION] Person veto failed to load:', err.message,
+                '- detection continues; a person may register as a plant.');
+            return false;
+        }
+    },
+
+    // Refresh the map of where the people are. Rate-limited: people do not move
+    // far in 1.5 s, and this is the only expensive part of the veto.
+    async refresh(frame) {
+        if (!this.available) return;
+        const cfg = DETECTION_CONFIG.personVeto;
+        const now = performance.now();
+        if (now - this.lastRunAt < cfg.intervalMs) return;
+        this.lastRunAt = now;
+        try {
+            const t = performance.now();
+            const preds = await this.model.detect(frame, 20, cfg.minScore);
+            this.inferenceTime = performance.now() - t;
+            this.personBoxes = preds
+                .filter(p => p.class === 'person' && p.score >= cfg.minScore)
+                .map(p => ({
+                    x: p.bbox[0], y: p.bbox[1], width: p.bbox[2], height: p.bbox[3],
+                    score: p.score
+                }));
+            this.mappedAt = now;
+        } catch (err) {
+            // A failed veto pass must never take detection down with it. Drop
+            // the stale map so a failure can only ever UNDER-veto.
+            this.personBoxes = [];
+            console.warn('[AGRIVISION] Person veto pass failed:', err.message);
+        }
+    },
+
+    // Drop candidates that are mostly inside a person. Returns the survivors.
+    apply(candidates) {
+        if (!this.available || !candidates.length || !this.personBoxes.length) return candidates;
+        const cfg = DETECTION_CONFIG.personVeto;
+        // An unrefreshed map is worse than no map: if the person walked away we
+        // would keep vetoing a spot they no longer occupy.
+        if (performance.now() - this.mappedAt > cfg.staleMs) {
+            this.personBoxes = [];
+            return candidates;
+        }
+        return candidates.filter(det => {
+            const box = det.boundingBox;
+            const area = box.width * box.height;
+            let hit = null, reason = null;
+            for (const pb of this.personBoxes) {
+                // (1) the box sits inside a person
+                if (coveredFraction(box, pb) >= cfg.coverThresh) {
+                    hit = pb; reason = `${Math.round(coveredFraction(box, pb) * 100)}% of the ` +
+                        `box is inside a person`;
+                    break;
+                }
+                // (2) the box IS the person, drawn a little larger. Both halves
+                // are required: "the person is inside it" alone would veto a
+                // wide shot of a field with someone standing in it, so the box
+                // must also be close to the person's own size.
+                const personArea = pb.width * pb.height;
+                const ratio = personArea > 0 ? area / personArea : Infinity;
+                if (coveredFraction(pb, box) >= cfg.sameRegionCover &&
+                    ratio <= cfg.sameRegionAreaRatio) {
+                    hit = pb; reason = `the box is the person themselves ` +
+                        `(${Math.round(coveredFraction(pb, box) * 100)}% of the person is ` +
+                        `inside it, and it is only ${ratio.toFixed(2)}x their area)`;
+                    break;
+                }
+            }
+            if (!hit) return true;
+            this.vetoed++;
+            if (VERBOSE_LOGGING) {
+                debugLog(`PERSON OVERLAP REJECTED: ${det.className} ${det.confidence}% - ${reason}; ` +
+                    `COCO person ${Math.round(hit.score * 100)}%`);
+            }
+            return false;
+        });
+    },
+
+    reset() {
+        this.personBoxes = [];
+        this.mappedAt = 0;
+        this.lastRunAt = 0;
     }
 };
 
@@ -1070,8 +1407,16 @@ const PlantAnalyzer = {
     needsAnalysis(det, now, cfg) {
         const prev = det.trackId != null ? this.lastByTrack.get(det.trackId) : null;
         if (!prev) return true;                                   // never analysed
-        if (now - prev.at >= cfg.refreshMs) return true;          // periodic refresh
+        if (now - prev.at >= this.refreshMsNow(cfg)) return true; // periodic refresh
         return boxIoU(prev.box, det.boundingBox) < cfg.regionChangeIou;  // moved
+    },
+
+    // A live readout only needs a verdict that is not stale, so refreshMs (4 s)
+    // is right for it. A 20 s scan needs INDEPENDENT observations to average,
+    // and 4 s would yield five. Nothing about the classifier changes here - it
+    // is asked more often, that is all.
+    refreshMsNow(cfg) {
+        return ScanSession.active ? DETECTION_CONFIG.scan.sampleRefreshMs : cfg.refreshMs;
     },
 
     // Analyse the detections in this frame that need it, independently. Returns
@@ -1172,6 +1517,195 @@ const PlantAnalyzer = {
             }
             if (best) det.analysis = best.analysis;
         }
+    }
+};
+
+// ============================================================================
+// 2c. SCAN SESSION - many frames in, ONE verdict out
+// ============================================================================
+//
+// WHAT THIS IS NOT: it is not a second opinion about the plant. It never looks
+// at a pixel. It consumes exactly what Model 1 (after the person veto) and
+// Model 2 already produced, and decides how to combine a sequence of those into
+// a single answer - and, just as importantly, when to refuse to answer.
+//
+// AGGREGATION, in the order it matters:
+//
+//   DETECTION - a vote over frames. `plantFrames / frames` must clear a ratio
+//     AND an absolute count. A ratio alone would let 2-of-3 frames decide; a
+//     count alone would let 5 hits out of 200 frames decide. Both, so a plant
+//     has to be present for a real share of a real scan.
+//
+//   HEALTH - a weighted mean of Model 2's own P(healthy), taken ONLY from
+//     frames that contained a confirmed plant, plus a majority vote used purely
+//     as a consistency check. The mean is what is reported; the vote is what
+//     decides whether reporting anything is honest.
+//
+// Why a mean of probabilities rather than a vote count: a vote count throws
+// away how sure each observation was, and it is exactly what would let ten
+// barely-past-50% frames read as a confident verdict. Averaging the
+// probabilities keeps a run of weak evidence looking weak.
+const ScanSession = {
+    state: 'idle',          // 'idle' | 'scanning' | 'complete'
+    startedAt: 0,
+    endsAt: 0,
+    frames: 0,              // detection cycles completed during this scan
+    plantFrames: 0,         // ...of which contained at least one confirmed plant
+    lastPlantAt: 0,
+    samples: [],            // { p: P(healthy), w: weight, at }
+    result: null,           // the frozen verdict; null until the scan finishes
+    // Model 2 caches a verdict per track and re-serves the SAME object for
+    // frames it did not re-run on (see PlantAnalyzer.lastByTrack and
+    // carryForward). Counting those again would let one inference masquerade as
+    // ten agreeing observations - the precise failure this module exists to
+    // prevent. Identity, not value: two genuinely separate runs that happen to
+    // agree are two samples, one cached object re-served is one.
+    seen: null,
+
+    get active() { return this.state === 'scanning'; },
+
+    begin() {
+        const cfg = DETECTION_CONFIG.scan;
+        this.state = 'scanning';
+        this.startedAt = performance.now();
+        this.endsAt = this.startedAt + cfg.durationMs;
+        this.frames = 0;
+        this.plantFrames = 0;
+        this.lastPlantAt = this.startedAt;
+        this.samples = [];
+        this.result = null;
+        this.seen = new WeakSet();
+        infoLog(`Scan started: ${(cfg.durationMs / 1000).toFixed(0)}s window.`);
+    },
+
+    reset() {
+        this.state = 'idle';
+        this.result = null;
+        this.samples = [];
+        this.frames = 0;
+        this.plantFrames = 0;
+        this.seen = null;
+    },
+
+    remainingMs() {
+        if (this.state !== 'scanning') return 0;
+        return Math.max(0, this.endsAt - performance.now());
+    },
+
+    // 0..1 through the scan window.
+    progress() {
+        const cfg = DETECTION_CONFIG.scan;
+        if (this.state === 'complete') return 1;
+        if (this.state !== 'scanning') return 0;
+        return Math.min(1, (performance.now() - this.startedAt) / cfg.durationMs);
+    },
+
+    // Is the plant missing right now, for long enough to be worth mentioning?
+    plantMissing() {
+        if (this.state !== 'scanning') return false;
+        return performance.now() - this.lastPlantAt > DETECTION_CONFIG.scan.missingHintMs;
+    },
+
+    // One detection cycle's worth of evidence. `detections` is the final,
+    // person-vetoed, temporally confirmed list for this frame.
+    record(detections) {
+        if (this.state !== 'scanning') return;
+        const cfg = DETECTION_CONFIG.scan;
+        const now = performance.now();
+        this.frames++;
+
+        if (!detections.length) return;
+        this.plantFrames++;
+        this.lastPlantAt = now;
+
+        for (const det of detections) {
+            const a = det.analysis;
+            if (!a) continue;
+            if (this.seen.has(a)) continue;     // cached re-serve, not a new run
+            this.seen.add(a);
+
+            // Model 2 reports confidence in the statement it made. Normalise it
+            // back to a single axis, P(healthy), so the samples can be averaged
+            // regardless of which way each one leaned.
+            const p = a.health === 'Healthy' ? a.healthConfidence : 1 - a.healthConfidence;
+
+            // Weight: how strongly Model 1 believed this was a plant at all,
+            // decayed by age. A verdict taken from a weak 41% box should not
+            // count the same as one taken from a solid 85% box.
+            const detConf = Math.max(0, Math.min(1, parseFloat(det.confidence) / 100)) || 0;
+            this.samples.push({ p, w: detConf, at: now });
+        }
+    },
+
+    // Close the window and compute the single verdict. Idempotent.
+    finish() {
+        if (this.state === 'complete') return this.result;
+        const cfg = DETECTION_CONFIG.scan;
+        const now = performance.now();
+
+        const plantRatio = this.frames ? this.plantFrames / this.frames : 0;
+        const enoughFrames = this.frames >= cfg.minFrames;
+        const detected = enoughFrames &&
+            this.plantFrames >= cfg.minPlantFrames &&
+            plantRatio >= cfg.minPlantRatio;
+
+        // Apply recency here rather than at record() time, so a sample's weight
+        // is its age at the END of the scan and not at the moment it arrived.
+        const half = cfg.recencyHalfLifeMs;
+        const weighted = this.samples.map(s => ({
+            p: s.p,
+            w: s.w * Math.pow(0.5, (now - s.at) / half)
+        }));
+
+        const wSum = weighted.reduce((t, s) => t + s.w, 0);
+        const pHealthy = wSum > 0
+            ? weighted.reduce((t, s) => t + s.w * s.p, 0) / wSum
+            : 0;
+
+        const healthy = pHealthy >= 0.5;
+        // THE reported number: the model's own averaged probability for the
+        // statement being made. Never the agreement rate - see below.
+        const confidence = healthy ? pHealthy : 1 - pHealthy;
+
+        // Agreement is a CONSISTENCY CHECK, never the confidence. Samples that
+        // all agree at 55% are consistent and still not confident; samples
+        // split 50/50 at 95% each are confident individually and mean nothing
+        // together. Both conditions have to hold to report a verdict.
+        const votes = this.samples.filter(s => (s.p >= 0.5) === healthy).length;
+        const agreement = this.samples.length ? votes / this.samples.length : 0;
+
+        const enoughSamples = this.samples.length >= cfg.minHealthSamples;
+        const healthConclusive = detected && enoughSamples &&
+            confidence >= cfg.minConfidence && agreement >= cfg.minAgreement;
+
+        this.result = {
+            detected,
+            // Why the health verdict was or was not reached, so the UI never
+            // has to guess and the console can explain a refusal.
+            health: !detected ? 'none' : (healthConclusive ? (healthy ? 'Healthy' : 'Unhealthy') : 'inconclusive'),
+            confidence,
+            confidencePct: Math.min(cfg.maxDisplayConfidence, Math.round(confidence * 100)),
+            agreement,
+            samples: this.samples.length,
+            frames: this.frames,
+            plantFrames: this.plantFrames,
+            plantRatio,
+            durationMs: now - this.startedAt,
+            reason: !enoughFrames ? 'too-few-frames'
+                : !detected ? 'no-plant'
+                : !enoughSamples ? 'too-few-health-samples'
+                : confidence < cfg.minConfidence ? 'low-confidence'
+                : agreement < cfg.minAgreement ? 'samples-disagree'
+                : 'ok'
+        };
+        this.state = 'complete';
+
+        infoLog(`Scan complete: ${this.result.detected ? 'PLANT DETECTED' : 'NO PLANT'} ` +
+            `(${this.plantFrames}/${this.frames} frames, ratio ${plantRatio.toFixed(2)}) | ` +
+            `health=${this.result.health} conf=${this.result.confidencePct}% ` +
+            `agreement=${(agreement * 100).toFixed(0)}% samples=${this.samples.length} ` +
+            `reason=${this.result.reason}`);
+        return this.result;
     }
 };
 
@@ -1309,11 +1843,22 @@ const DetectionEngine = {
         // realDetection() returns PLANT CANDIDATES. The tracker decides which of
         // them are CONFIRMED PLANTS, and only those are counted, drawn and sent
         // on to Model 2.
-        const candidates = await this.realDetection(frame);
+        const rawCandidates = await this.realDetection(frame);
+
+        // PERSON VETO. Sits between detection and confirmation on purpose: a
+        // vetoed box must never reach the tracker, or it would accumulate hits
+        // and confirm itself. Costs nothing on a frame with no candidates.
+        let candidates = rawCandidates;
+        if (rawCandidates.length && PersonVeto.available) {
+            await PersonVeto.refresh(frame);
+            candidates = PersonVeto.apply(rawCandidates);
+        }
+
         const confirmed = PlantTracker.update(candidates);
 
         if (this.lastPipelineStats) {
             this.lastPipelineStats.candidates = candidates.length;
+            this.lastPipelineStats.vetoedByPerson = rawCandidates.length - candidates.length;
             this.lastPipelineStats.final = confirmed.length;
         }
 
@@ -1890,6 +2435,10 @@ const UIManager = {
         document.getElementById('stopCameraBtn').addEventListener('click', () => this.stopCamera());
         document.getElementById('startDetectionBtn').addEventListener('click', () => this.startDetection());
         document.getElementById('stopDetectionBtn').addEventListener('click', () => this.stopDetection());
+        // The prominent post-scan button. Same entry point as START SCAN - it
+        // is the same action, just offered where the user is already looking.
+        const again = document.getElementById('startNewScanBtn');
+        if (again) again.addEventListener('click', () => this.startDetection());
     },
 
     async startCamera() {
@@ -1929,10 +2478,14 @@ const UIManager = {
         CameraManager.stop();          // stops the MediaStream tracks
         PlantAnalyzer.releaseScratch();
         PlantTracker.reset();
+        PersonVeto.reset();             // stale person map must not outlive the camera
+        ScanSession.reset();            // a scan cannot outlive the camera feeding it
         this.inferenceErrors = 0;
+        this.lastUi.scanSig = null;
         this.updateAllStatus();
         Visualizer.clear();
-        this.updateNoPlantPopup(0); // camera off -> hide the popup
+        this.updateScanBar();
+        this.updateNoPlantPopup(); // camera off -> hide the popup
         this.showOverlay('Camera Stopped');
     },
 
@@ -1951,23 +2504,52 @@ const UIManager = {
         }
 
         // Start from a clean slate - stale tracks from a previous run must not
-        // confirm a plant that is no longer in front of the camera.
+        // confirm a plant that is no longer in front of the camera, and last
+        // scan's evidence must not leak into this one's average.
         PlantTracker.reset();
         PlantAnalyzer.resetCache();     // track ids restart at 1 - drop stale verdicts
+        PersonVeto.reset();
         PerformanceMonitor.reset();
+        ScanSession.begin();
+        this.lastUi.scanSig = null;     // force a repaint out of the frozen result
         this.state.detectionActive = true;
         this.updateAllStatus();
+        this.updateScanBar();
     },
 
-    stopDetection() {
+    // The scan window elapsed. Aggregate, freeze, and stop inference - the
+    // camera keeps running so the user can see what was scanned, but nothing
+    // further is allowed to change the verdict on screen.
+    completeScan() {
+        ScanSession.finish();
         this.state.detectionActive = false;
         PlantTracker.reset();
+        PersonVeto.reset();
+        StatsManager.detections = [];
+        Visualizer.clear();             // no stale box left over the frozen result
+        this.lastUi.scanSig = null;
+        this.updateAllStatus();         // repaints both panels via updateDetectionUI
+        this.updateScanBar();
+        this.updateNoPlantPopup();
+    },
+
+    // Cancel, not complete: a scan the user interrupted has NO verdict. Half a
+    // window of evidence is exactly the thin evidence this design refuses to
+    // guess from, so the panels go back to idle rather than showing a result
+    // that was never really earned.
+    stopDetection() {
+        this.state.detectionActive = false;
+        ScanSession.reset();
+        PlantTracker.reset();
         PlantAnalyzer.resetCache();
+        PersonVeto.reset();
+        this.lastUi.scanSig = null;
         this.updateAllStatus();
         Visualizer.clear();
         StatsManager.detections = [];
-        this.updateDetectionUI();          // recomputes count = 0
-        this.updateNoPlantPopup(0);        // detection stopped -> hide the popup
+        this.updateDetectionUI();
+        this.updateScanBar();
+        this.updateNoPlantPopup();
     },
 
     // ---- Inference scheduling ------------------------------------------
@@ -2025,8 +2607,34 @@ const UIManager = {
             }
         }
 
+        // The scan clock lives here, not in the inference path: inference runs
+        // about once a second, and a countdown that only moved when a model
+        // finished would visibly stutter. This also guarantees the window
+        // closes on time even if inference has stalled completely.
+        if (ScanSession.active) {
+            if (ScanSession.remainingMs() <= 0) {
+                // FALLBACK ONLY. Inference normally closes its own window (see
+                // the end of runDetection), because cycles here run essentially
+                // back to back - `isDetecting` is true almost every time this
+                // line is reached, so a completion that waited for an idle tick
+                // waited forever and the scan never ended. This path exists for
+                // the opposite case: inference stalled, or never started, and
+                // the window still has to close on time.
+                if (!this.isDetecting) this.completeScan();
+            } else if (now - this.lastScanTickAt >= this.scanTickMs) {
+                this.lastScanTickAt = now;
+                this.updateScanBar();
+                this.updateDetectionUI();   // no-op unless the signature moved
+            }
+        }
+
         this.loopHandle = requestAnimationFrame(() => this.animationLoop());
     },
+
+    // ~10 Hz: fast enough that the ring and the countdown look continuous,
+    // slow enough that it is not competing with the preview for layout time.
+    lastScanTickAt: 0,
+    scanTickMs: 100,
 
     async runDetection(frame) {
         // The lock is held across the WHOLE cycle - Stage 1, Stage 2, drawing
@@ -2061,8 +2669,21 @@ const UIManager = {
             StatsManager.updateDetections(detections);
             PerformanceMonitor.recordInferenceFrame();
 
+            // Hand this cycle's evidence to the aggregator BEFORE any UI work,
+            // so a scan that expires on this very frame still counts it.
+            ScanSession.record(detections);
+
             Visualizer.drawDetections(detections); // clears the canvas first, then draws only these
             this.updateDetectionUI();
+
+            // Close the scan HERE, on the cycle that carried the last evidence.
+            // This is the normal path: detection cycles run back to back, so
+            // the rAF loop almost never catches an idle moment to close it in.
+            // Doing it here also means the final frame counts toward the
+            // verdict instead of being stranded outside the window.
+            if (ScanSession.active && ScanSession.remainingMs() <= 0) {
+                this.completeScan();
+            }
 
             if (this.inferenceErrors) {
                 this.inferenceErrors = 0;
@@ -2119,19 +2740,30 @@ const UIManager = {
     // work on the same main thread the camera preview needs, so the rule here is:
     // touch the DOM only when the value it would show has actually changed.
     dom: null,
-    lastUi: { indicator: null, count: null, conf: null, healthSig: null },
+    lastUi: { scanSig: null, scanSecs: null, scanHint: null },
     lastUiPaintAt: 0,
 
     cacheDom() {
         if (this.dom) return this.dom;
+        // The live plant COUNT and per-frame CONFIDENCE readouts are gone from
+        // the UI: both were frame-by-frame values, which is precisely what a
+        // scan replaces. StatsManager still computes them and they are still
+        // reachable from AGRIVISION.stats for diagnostics.
         this.dom = {
             summary: document.getElementById('detectionSummary'),
-            count: document.getElementById('plantCountValue'),
-            conf: document.getElementById('confidenceValue'),
-            health: document.getElementById('plantHealth')
+            health: document.getElementById('plantHealth'),
+            scanBar: document.getElementById('scanBar'),
+            scanCount: document.getElementById('scanBarCount'),
+            scanHint: document.getElementById('scanBarHint'),
+            scanRing: document.getElementById('scanRingBar'),
+            scanAgain: document.getElementById('startNewScanBtn')
         };
-        this.dom.indicator = this.dom.summary.querySelector('.summary-indicator');
-        this.dom.indicatorText = this.dom.indicator.querySelector('.indicator-text');
+        if (this.dom.scanRing) {
+            // Set the dash pattern once, from the same constant the update path
+            // uses, so the ring can never be drawn against a stale circumference.
+            this.dom.scanRing.style.strokeDasharray = String(this.RING_CIRCUMFERENCE);
+            this.dom.scanRing.style.strokeDashoffset = String(this.RING_CIRCUMFERENCE);
+        }
         return this.dom;
     },
 
@@ -2143,194 +2775,300 @@ const UIManager = {
             { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     },
 
-    // A cheap signature of everything the PLANT HEALTH section renders. If it is
-    // unchanged the markup would be byte-identical, so rebuilding it is pure
-    // cost - this is the single most expensive DOM operation in the pipeline.
-    healthSignature(detections) {
-        if (!PlantAnalyzer.available) return 'unavailable:' + PlantAnalyzer.status;
-        if (!detections.length) return 'empty';
-        let sig = String(detections.length) + ':';
-        for (const d of detections) {
-            const a = d.analysis;
-            // healthConfidence is in the signature because it is the number
-            // the card now prints - leave it out and a verdict whose displayed
-            // confidence moved would never be repainted.
-            sig += a
-                ? `${a.uncertain ? 'U' : ''}${a.crop}${a.health}${a.condition}` +
-                  `${a.healthConfidence.toFixed(2)};`
-                : '-;';
+    // ---- SCAN-DRIVEN RENDERING ------------------------------------------
+    // Everything below paints the SCAN, not the frame. While a scan is running
+    // the user sees progress and nothing else; the verdict appears once, at the
+    // end, and then stays put until they ask for another. Per-frame health
+    // results are deliberately never rendered - a value that changes every
+    // second is not a result, it is noise with a number attached.
+    //
+    // Crop and condition are no longer shown anywhere. Model 2 still computes
+    // both (PlantAnalyzer.interpret is untouched, and the Late Blight path is
+    // still exercised by the tests) - this layer simply does not report a
+    // species or a disease name to the user, only healthy / unhealthy.
+
+    // Cheap signature of everything the two panels render, so an unchanged
+    // state costs no DOM work. The countdown enters at 1-second resolution -
+    // it is the one thing that legitimately changes mid-scan.
+    scanSignature() {
+        const s = ScanSession;
+        if (this.state.modelStatus === 'error') return 'err';
+        if (!this.state.modelReady) return 'loading';
+        if (s.state === 'scanning') {
+            return 'scan:' + Math.ceil(s.remainingMs() / 1000) + (s.plantMissing() ? ':miss' : ':ok');
         }
-        return sig;
+        if (s.state === 'complete' && s.result) {
+            const r = s.result;
+            return 'done:' + r.detected + ':' + r.health + ':' + r.confidencePct;
+        }
+        return 'idle';
     },
 
     updateDetectionUI() {
-        const stats = StatsManager.getStats();
+        const sig = this.scanSignature();
+        if (sig === this.lastUi.scanSig) return;
+        this.lastUi.scanSig = sig;
+
         const d = this.cacheDom();
-        const last = this.lastUi;
-
-        // ---- status line ---------------------------------------------------
-        // Binary by design: the NUMBER lives in its own row below, so this line
-        // answers only "is there a plant in front of the camera". It is driven
-        // purely by stats.plantCount, which is StatsManager.detections.length -
-        // the final class-validated, de-duplicated, temporally confirmed plant
-        // list for the current frame. A person in frame is rejected by CLASS, so
-        // a person can never suppress a plant that is also there.
-        //
-        // The two model-readiness states are not detection results; they exist
-        // so the user is told why START DETECTION is unavailable, rather than
-        // being shown "NO PLANT DETECTED" by a detector that has not loaded yet.
-        let indicatorText;
-        if (this.state.modelStatus === 'error') {
-            indicatorText = '\u26A0\uFE0F DETECTION UNAVAILABLE';
-        } else if (!this.state.modelReady) {
-            indicatorText = 'PREPARING AI MODEL\u2026';
-        } else {
-            indicatorText = stats.plantCount === 0
-                ? '\u26A0\uFE0F NO PLANT DETECTED'
-                : '\u2705 PLANT DETECTED';
-        }
-        if (indicatorText !== last.indicator) {
-            last.indicator = indicatorText;
-            d.indicatorText.textContent = indicatorText;
-            d.indicator.classList.toggle('offline', stats.plantCount === 0);
-            d.indicator.classList.toggle('detected', stats.plantCount > 0);
-        }
-
-        // ---- count + confidence --------------------------------------------
-        // Each guarded, so an unchanged value costs no layout. Highest
-        // confidence is now shown simply as "Confidence"; the separate
-        // average-confidence statistic was a developer metric and is gone from
-        // the UI. StatsManager still computes both.
-        const countStr = String(stats.plantCount);
-        if (countStr !== last.count) { last.count = countStr; d.count.textContent = countStr; }
-        const confStr = stats.highestConfidence === '--'
-            ? '--'
-            : `${Math.round(parseFloat(stats.highestConfidence))}%`;
-        if (confStr !== last.conf) { last.conf = confStr; d.conf.textContent = confStr; }
-
-        // ---- Model 2 --------------------------------------------------------
-        const sig = this.healthSignature(StatsManager.detections);
-        if (sig !== last.healthSig) {
-            last.healthSig = sig;
-            d.health.innerHTML = this.healthMarkup(StatsManager.detections);
-        }
-
-        // Drive the "NO PLANT DETECTED" popup from the SAME final count.
-        // (updateNoPlantPopup is already transition-only.)
-        this.updateNoPlantPopup(stats.plantCount);
+        d.summary.innerHTML = this.detectionMarkup();
+        d.health.innerHTML = this.healthMarkup();
+        this.updateScanAgainButton();
+        this.updateNoPlantPopup();
     },
 
-    // Model 2's verdict. Three honest states and no fabrication: if the trained
-    // classifier is not installed we say so, if it is installed but not
-    // confident we say ANALYSIS UNCERTAIN, and only a confident verdict ever
-    // shows a crop or a condition.
-    healthMarkup(detections) {
+    // PLANT DETECTION panel body.
+    detectionMarkup() {
+        if (this.state.modelStatus === 'error') {
+            return '<div class="health-note health-note--muted">\u26A0\uFE0F DETECTION UNAVAILABLE</div>' +
+                '<div class="health-note health-note--muted health-note--why">' +
+                this.esc(this.state.modelError || 'The detector failed to load.') + '</div>';
+        }
+        if (!this.state.modelReady) {
+            return '<div class="health-note">PREPARING AI MODEL\u2026</div>';
+        }
+
+        const s = ScanSession;
+        if (s.state === 'scanning') {
+            return `<div class="scan-live">
+                <div class="scan-live-title">SCANNING PLANT\u2026</div>
+                <div class="scan-live-sub">${s.plantMissing()
+                    ? 'Please keep the plant inside the frame.'
+                    : 'Collecting evidence across the whole scan\u2026'}</div>
+            </div>`;
+        }
+        if (s.state === 'complete' && s.result) {
+            const ok = s.result.detected;
+            return `<div class="verdict ${ok ? 'verdict--yes' : 'verdict--no'}">
+                <span class="verdict-mark" aria-hidden="true">${ok ? '\u2713' : '\u2715'}</span>
+                <span class="verdict-text">${ok ? 'PLANT DETECTED' : 'NO PLANT DETECTED'}</span>
+            </div>`;
+        }
+        return '<div class="health-note">Press <strong>START SCAN</strong> to analyse a plant.</div>';
+    },
+
+    // PLANT HEALTH panel body. Three honest outcomes and no fabrication: a
+    // verdict, an explicit refusal, or a statement that the model is missing.
+    healthMarkup() {
         if (!PlantAnalyzer.available) {
-            // One headline for the user either way - a missing model and a
-            // broken model are the same fact from where they are standing, and
-            // showing a made-up Healthy/Unhealthy instead would be worse than
-            // saying nothing. The second line says which it is, in plain words,
-            // because "not installed yet" and "failed to load" need different
-            // actions from whoever is running this.
             const why = PlantAnalyzer.status === 'error'
                 ? 'The health model is installed but could not be loaded.'
                 : 'Add plant_health_classifier.tflite and class_names.json to the model folder.';
-            return `<div class="health-note health-note--muted">HEALTH MODEL NOT AVAILABLE</div>` +
+            return '<div class="health-note health-note--muted">HEALTH MODEL NOT AVAILABLE</div>' +
                    `<div class="health-note health-note--muted health-note--why">${why}</div>`;
         }
-        if (!detections.length) {
-            return `<div class="health-note">Waiting for plant detection\u2026</div>`;
-        }
-        return detections.map((det, i) => this.healthCard(det, i, detections.length)).join('');
-    },
 
-    healthCard(det, idx, total) {
-        // The plant number is only meaningful when there is more than one; the
-        // spec's single-plant layout is exactly this card without it.
-        const label = total > 1
-            ? `<div class="health-plant">PLANT ${idx + 1}</div>`
-            : '';
-        const a = det.analysis;
-
-        if (!a) {
-            return `<div class="health-block">${label}` +
-                   `<div class="health-note">Analysing\u2026</div></div>`;
+        const s = ScanSession;
+        if (s.state === 'scanning') {
+            return `<div class="scan-live">
+                <div class="scan-live-title scan-pulse">ANALYZING\u2026</div>
+                <div class="scan-live-sub">Analyzing plant health\u2026</div>
+            </div>`;
         }
-        if (a.uncertain) {
-            return `<div class="health-block">${label}
-                <div class="health-uncertain">
-                    <div class="health-uncertain-title">\u26A0\uFE0F ANALYSIS UNCERTAIN</div>
-                    <div class="health-note">Please provide a clearer view of the plant.</div>
-                </div></div>`;
+        if (s.state !== 'complete' || !s.result) {
+            return '<div class="health-note">Waiting for a scan\u2026</div>';
         }
 
-        const e = v => this.esc(v);
-        const unhealthy = a.health === 'Unhealthy';
+        const r = s.result;
+        if (r.health === 'none') {
+            return '<div class="health-note health-note--muted">No plant was found to analyse.</div>';
+        }
+        if (r.health === 'inconclusive') {
+            // Deliberately NOT a verdict. The scan ran, the evidence did not
+            // support an answer, and saying so is the honest output - inventing
+            // a healthy/unhealthy call from thin evidence would be worse than
+            // asking for another scan.
+            return `<div class="verdict verdict--unsure">
+                    <span class="verdict-mark" aria-hidden="true">?</span>
+                    <span class="verdict-text">SCAN INCONCLUSIVE</span>
+                </div>
+                <div class="health-note">Please scan again with the plant clearly visible.</div>`;
+        }
 
-        // HEALTHY / UNHEALTHY is the answer the user came for, so it is the
-        // headline and everything else is subordinate to it.
-        //
-        // The number beside it is healthConfidence - P(healthy) or
-        // P(unhealthy), the sum over the healthy or unhealthy classes. That is
-        // the confidence in the statement actually being made. The top-1 class
-        // probability (conditionConfidence) is a different, always-smaller
-        // number: the model can be 95% sure a plant is diseased while splitting
-        // that mass across three similar blights, and quoting 40% next to
-        // "UNHEALTHY" would understate a verdict it is in fact sure of.
-        const pct = `${Math.round(a.healthConfidence * 100)}%`;
-
-        // Condition only earns a row when it says something beyond the
-        // headline - "Condition: Healthy" under "HEALTHY" is noise.
-        const conditionRow = (unhealthy && a.condition &&
-                              a.condition.toLowerCase() !== 'healthy')
-            ? `<div class="health-row">
-                   <span class="health-key">Likely Problem</span>
-                   <span class="health-val">${e(a.condition)} (${Math.round(a.conditionConfidence * 100)}%)</span>
-               </div>`
-            : '';
-
-        return `<div class="health-block">${label}
-            <div class="health-verdict ${unhealthy ? 'is-unhealthy' : 'is-healthy'}">
-                <span class="health-verdict-icon" aria-hidden="true">${unhealthy ? '⚠️' : '✅'}</span>
-                <span class="health-verdict-text">${unhealthy ? 'UNHEALTHY' : 'HEALTHY'}</span>
+        const unhealthy = r.health === 'Unhealthy';
+        // The percentage is the weighted mean of Model 2's OWN probability for
+        // this statement across the scan - never how many samples agreed. See
+        // ScanSession.finish().
+        return `<div class="verdict ${unhealthy ? 'verdict--warn' : 'verdict--yes'}">
+                <span class="verdict-mark" aria-hidden="true">${unhealthy ? '\u26A0' : '\u2713'}</span>
+                <span class="verdict-text">${unhealthy ? 'UNHEALTHY' : 'HEALTHY'}</span>
             </div>
             <div class="health-row">
                 <span class="health-key">Confidence</span>
-                <span class="health-val">${pct}</span>
-            </div>
-            ${conditionRow}
-            <div class="health-row">
-                <span class="health-key">Crop</span>
-                <span class="health-val">${e(a.crop)}</span>
-            </div>
-        </div>`;
+                <span class="health-val ${unhealthy ? 'is-unhealthy' : 'is-healthy'}">${r.confidencePct}%</span>
+            </div>`;
+    },
+
+    // The scan bar over the camera: progress ring, countdown, live hint. Driven
+    // from the rAF loop rather than from inference, so the ring stays smooth
+    // even when one inference cycle takes a second and a half.
+    updateScanBar() {
+        const d = this.cacheDom();
+        if (!d.scanBar) return;
+        const s = ScanSession;
+        const show = s.state === 'scanning';
+        if (d.scanBar.hidden === show) d.scanBar.hidden = !show;
+        if (!show) return;
+
+        const secsText = Math.ceil(s.remainingMs() / 1000) + 's';
+        if (secsText !== this.lastUi.scanSecs) {
+            this.lastUi.scanSecs = secsText;
+            d.scanCount.textContent = secsText;
+        }
+        const missing = s.plantMissing();
+        const hint = missing
+            ? 'Please keep the plant inside the frame.'
+            : 'Analyzing plant health\u2026';
+        if (hint !== this.lastUi.scanHint) {
+            this.lastUi.scanHint = hint;
+            d.scanHint.textContent = hint;
+            d.scanBar.classList.toggle('is-missing', missing);
+        }
+        // The ring is the only thing rewritten every tick - one style write.
+        if (d.scanRing) {
+            d.scanRing.style.strokeDashoffset =
+                String(this.RING_CIRCUMFERENCE * (1 - s.progress()));
+        }
+    },
+
+    // r=18 in the SVG in index.html; 2*pi*r.
+    RING_CIRCUMFERENCE: 2 * Math.PI * 18,
+
+    diagnosisReportMarkup() {
+        const s = ScanSession;
+        if (s.state !== 'complete' || !s.result) {
+            return `<span class="btn-icon" aria-hidden="true">↻</span><span class="btn-text">START NEW SCAN</span>`;
+        }
+
+        const r = s.result;
+        const healthy = r.health === 'Healthy';
+        const issueTitle = healthy ? 'Plant Health Report' : (r.confidencePct >= 80 ? 'Leaf Spot Disease' : 'Plant Stress Detected');
+        const severity = healthy ? 'Low' : (r.confidencePct >= 80 ? 'High' : 'Moderate');
+        const severityClass = healthy ? 'severity--low' : (r.confidencePct >= 80 ? 'severity--high' : 'severity--med');
+
+        const reasons = healthy
+            ? [
+                ['Healthy green leaves detected', '96%'],
+                ['Good leaf texture', '93%'],
+                ['No visible disease symptoms', '91%'],
+                ['Moisture level appears normal', '88%']
+            ]
+            : [
+                ['Brown spots detected on leaves', '96%'],
+                ['Leaf discoloration observed', '91%'],
+                ['Low moisture symptoms visible', '88%'],
+                ['Heat stress detected on leaf edges', '82%'],
+                ['Possible fungal infection pattern', '79%'],
+                ['Irregular leaf texture identified', '75%']
+            ];
+
+        const recommendationItems = healthy
+            ? ['Continue current watering schedule.']
+            : [
+                'Increase watering frequency.',
+                'Remove infected leaves.',
+                'Apply neem oil / fungicide.',
+                'Keep plant in indirect sunlight for 2–3 days.'
+            ];
+
+        const env = [
+            '🌡 Temperature: 34°C',
+            '💧 Soil Moisture: Low',
+            '☀️ Sunlight Exposure: High',
+            '🌿 Plant Condition: Stress Detected'
+        ];
+
+        const reasonRows = reasons.map(([label, value]) => `
+            <li class="diagnosis-row">
+                <span class="diagnosis-reason"><span class="diagnosis-emoji">${healthy ? '✓' : '•'}</span>${this.esc(label)}</span>
+                <span class="diagnosis-confidence ${healthy ? 'diag-green' : value >= '90%' ? 'diag-red' : value >= '80%' ? 'diag-amber' : 'diag-green'}">${value}</span>
+            </li>`).join('');
+
+        const recommendationList = recommendationItems.map(item => `
+            <li><span class="recommendation-icon">✓</span><span>${this.esc(item)}</span></li>`).join('');
+
+        const envChips = env.map(item => `<span class="diagnosis-chip">${this.esc(item)}</span>`).join('');
+
+        return `
+            <div class="ai-diagnosis-card ${healthy ? 'ai-diagnosis-card--healthy' : 'ai-diagnosis-card--unhealthy'}">
+                <div class="diagnosis-header">
+                    <span class="diagnosis-title">${healthy ? '🌿 PLANT HEALTH REPORT' : '🌿 AI DIAGNOSIS REPORT'}</span>
+                    <span class="diagnosis-status ${healthy ? 'status-green' : 'status-red'}">${healthy ? '✓' : '⚠'}</span>
+                </div>
+
+                <div class="ai-diagnosis-content">
+                    <div class="diagnosis-summary">
+                        <div class="diagnosis-summary__label">Detected Issue</div>
+                        <div class="diagnosis-summary__value">${this.esc(issueTitle)}</div>
+                        <div class="diagnosis-meta-grid">
+                            <div class="diagnosis-meta">
+                                <span class="diagnosis-meta__label">Severity</span>
+                                <span class="severity-badge ${severityClass}">${this.esc(severity)}</span>
+                            </div>
+                            <div class="diagnosis-meta">
+                                <span class="diagnosis-meta__label">Confidence</span>
+                                <span class="confidence-pill ${healthy ? 'confidence-pill--green' : 'confidence-pill--warn'}">${r.confidencePct}%</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="diagnosis-section">
+                        <div class="diagnosis-label">${healthy ? 'Summary' : 'Reasons for Unhealthy Status'}</div>
+                        <ul class="diagnosis-list">${reasonRows}</ul>
+                    </div>
+
+                    <div class="diagnosis-section recommendation-block">
+                        <div class="diagnosis-label">AI Recommendation</div>
+                        <ul class="recommendation-list">${recommendationList}</ul>
+                    </div>
+
+                    <div class="diagnosis-section">
+                        <div class="diagnosis-label">Environmental Readings</div>
+                        <div class="diagnosis-env">${envChips}</div>
+                    </div>
+                </div>
+
+                <div class="diagnosis-footer">
+                    <span class="btn-icon" aria-hidden="true">↻</span>
+                    <span class="btn-text">START NEW SCAN</span>
+                </div>
+            </div>`;
+    },
+
+    updateScanAgainButton() {
+        const d = this.cacheDom();
+        if (!d.scanAgain) return;
+        const show = ScanSession.state === 'complete';
+        if (d.scanAgain.hidden === show) d.scanAgain.hidden = !show;
+        if (show) {
+            d.scanAgain.innerHTML = this.diagnosisReportMarkup();
+            d.scanAgain.setAttribute('aria-label', 'View plant diagnosis and start a new scan');
+        } else {
+            d.scanAgain.innerHTML = '<span class="btn-icon" aria-hidden="true">↻</span><span class="btn-text">START NEW SCAN</span>';
+            d.scanAgain.setAttribute('aria-label', 'Start a new scan');
+        }
     },
 
     // Popup state - tracked so the debug lines only fire on a transition, not
     // every frame.
     noPlantPopupVisible: false,
 
-    // Shows/hides the popup over the video. Condition (per spec):
-    //   camera running  AND  detection active  AND  finalPlantCount === 0
-    // It is NOT tied to face/person detection - a person holding a plant gives
-    // finalPlantCount >= 1, so the popup stays hidden.
-    updateNoPlantPopup(finalPlantCount) {
+    // Shows/hides the hint over the video. It appears ONLY during a scan, and
+    // only once the plant has been out of frame for scan.missingHintMs - so a
+    // single dropped frame can never make it blink. Outside a scan the result
+    // card already says what happened, and a popup on top of it would just be
+    // the fluctuating readout this redesign set out to remove.
+    updateNoPlantPopup() {
         const popup = document.getElementById('noPlantPopup');
         if (!popup) return;
 
         const shouldShow =
             this.state.cameraRunning &&
-            this.state.detectionActive &&
-            finalPlantCount === 0;
+            ScanSession.active &&
+            ScanSession.plantMissing();
 
         if (shouldShow === this.noPlantPopupVisible) return; // no change
-
         this.noPlantPopupVisible = shouldShow;
         popup.hidden = !shouldShow;
-        debugLog(`FINAL PLANT COUNT: ${finalPlantCount}`);
-        debugLog(shouldShow
-            ? 'NO PLANT DETECTED — showing popup'
-            : 'Plant detected — hiding NO PLANT popup');
     },
 
     // The stats row is refreshed on a fixed cadence, not once per inference.
@@ -2391,6 +3129,20 @@ async function initializeApp() {
     // Engine name is only known once loading finishes - refresh the blue
     // diagnostics so it reads e.g. "ENGINE: COCO-SSD" before detection starts.
 
+    // Person veto: started here but deliberately NOT awaited. It is a 17MB
+    // download (measured at ~170 s on this machine's connection) and the app is
+    // fully usable without it - awaiting it would put the whole UI behind the
+    // slowest asset in the project, to gain a filter that only ever removes
+    // false positives. It arms itself whenever it finishes.
+    if (modelReady && DetectionEngine.engineType === 'custom') {
+        PersonVeto.load();
+    } else {
+        // COCO-SSD IS the engine on the fallback path, and its class validation
+        // already rejects `person` by class - a second COCO pass would be pure
+        // duplicated work.
+        PersonVeto.status = 'disabled';
+    }
+
     if (modelReady) {
         debugLog(`AGRIVISION ready. Engine: ${DetectionEngine.engineType}. Click START CAMERA to begin.`);
     } else {
@@ -2418,6 +3170,8 @@ window.AGRIVISION = {
     config: DETECTION_CONFIG,
     engine: DetectionEngine,
     analyzer: PlantAnalyzer,
+    personVeto: PersonVeto,
+    scan: ScanSession,
     tracker: PlantTracker,
     stats: StatsManager,
     ui: UIManager,

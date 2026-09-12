@@ -1451,7 +1451,7 @@ body:has(#stopDetectionBtn:not(:disabled)) .vf-scan {
 
 /* 4. A plant is confirmed: the reticle turns green and the frame locks on -
       one pulse, which re-runs each time the state flips back to detected. */
-body:has(.summary-indicator.detected) .vf-corner {
+body:has(#detectionSummary .verdict--yes) .vf-corner {
     border-color: var(--lock);
     box-shadow: 0 0 14px rgba(52, 211, 153, 0.45);
 }
@@ -1464,7 +1464,7 @@ body:has(.summary-indicator.detected) .vf-corner {
     opacity: 0;
 }
 
-body:has(.summary-indicator.detected) .vf-lock {
+body:has(#detectionSummary .verdict--yes) .vf-lock {
     animation: lock-on 0.75s cubic-bezier(0.15, 0.7, 0.2, 1) 1;
 }
 
@@ -1474,8 +1474,8 @@ body:has(.summary-indicator.detected) .vf-lock {
     100% { opacity: 0;   transform: perspective(700px) scale(0.985) translateZ(0); }
 }
 
-/* The count gets the same lock moment, once, in the sidebar. */
-body:has(.summary-indicator.detected) .summary-stat--headline .summary-value {
+/* The verdict gets the same lock moment, once, in the sidebar. */
+body:has(#detectionSummary .verdict--yes) .verdict-mark {
     animation: count-lock 0.5s cubic-bezier(0.2, 0.9, 0.3, 1) 1;
 }
 
@@ -1559,4 +1559,489 @@ body:has(.summary-indicator.detected) .summary-stat--headline .summary-value {
     line-height: 1.4;
     margin-top: 0.2rem;
     opacity: 0.75;
+}
+
+
+/* ==========================================================================
+   SCAN EXPERIENCE
+   The app no longer publishes a verdict per frame. It runs a fixed-length scan
+   and shows exactly one result. These are the two states that needs: progress
+   while it runs, and a single frozen card when it finishes.
+   ========================================================================== */
+
+/* ---- progress bar over the camera ---------------------------------------
+   Bottom-anchored and deliberately short. The operator is being asked to keep
+   a plant framed for twenty seconds, so the subject must never be covered. */
+.scan-bar {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.55rem 0.85rem;
+    border-radius: var(--radius-sm);
+    background: var(--glass-bg-strong);
+    border: 1px solid var(--glass-border);
+    box-shadow: var(--glass-shadow);
+    -webkit-backdrop-filter: blur(var(--blur));
+    backdrop-filter: blur(var(--blur));
+    animation: scan-bar-in 0.32s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+
+@keyframes scan-bar-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: none; }
+}
+
+/* The ring is the elapsed fraction of the window. Rotated so 0% starts at 12
+   o'clock, and transitioned so the ~10Hz updates read as continuous motion. */
+.scan-ring { flex: 0 0 auto; transform: rotate(-90deg); }
+
+.scan-ring-track {
+    fill: none;
+    stroke: rgba(148, 197, 175, 0.18);
+    stroke-width: 3;
+}
+
+.scan-ring-bar {
+    fill: none;
+    stroke: var(--secondary-color);
+    stroke-width: 3;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 0.12s linear;
+    filter: drop-shadow(0 0 5px rgba(6, 182, 212, 0.55));
+}
+
+.scan-bar-text { min-width: 0; flex: 1 1 auto; }
+
+.scan-bar-title {
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    color: var(--text-primary);
+    /* The one piece of motion that says "working" without a spinner. */
+    animation: scan-breathe 2.1s ease-in-out infinite;
+}
+
+.scan-bar-hint {
+    margin-top: 0.12rem;
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.scan-bar-count {
+    flex: 0 0 auto;
+    font-size: 0.95rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;   /* the width must not jump 9s -> 10s */
+    color: var(--secondary-color);
+}
+
+/* Plant out of frame for long enough to matter: amber, not alarming. */
+.scan-bar.is-missing { border-color: rgba(245, 158, 11, 0.45); }
+.scan-bar.is-missing .scan-bar-hint { color: var(--warning-color); }
+.scan-bar.is-missing .scan-ring-bar { stroke: var(--warning-color); }
+.scan-bar.is-missing .scan-bar-count { color: var(--warning-color); }
+
+@keyframes scan-breathe {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.62; }
+}
+
+/* ---- in-panel scanning state -------------------------------------------- */
+.scan-live { padding: 0.15rem 0; }
+
+.scan-live-title {
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--secondary-color);
+}
+
+.scan-live-sub {
+    margin-top: 0.25rem;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+}
+
+.scan-pulse { animation: scan-breathe 1.6s ease-in-out infinite; }
+
+/* ---- the result card ----------------------------------------------------
+   One line, one glyph, one colour. Everything the scan decided, and nothing
+   it did not: no crop, no disease name, no per-frame numbers. */
+.verdict {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.6rem 0.75rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    font-size: 0.86rem;
+    animation: verdict-in 0.34s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+
+@keyframes verdict-in {
+    from { opacity: 0; transform: translateY(6px) scale(0.985); }
+    to   { opacity: 1; transform: none; }
+}
+
+.verdict-mark { font-size: 1rem; line-height: 1; }
+.verdict-text { min-width: 0; }
+
+.verdict--yes {
+    color: var(--primary-color);
+    background: rgba(16, 185, 129, 0.12);
+    border-color: rgba(16, 185, 129, 0.32);
+}
+
+.verdict--warn {
+    color: var(--warning-color);
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(245, 158, 11, 0.32);
+}
+
+.verdict--no {
+    color: var(--text-secondary);
+    background: rgba(100, 116, 139, 0.14);
+    border-color: rgba(100, 116, 139, 0.3);
+}
+
+/* Inconclusive is its own state, not a soft failure of one of the others -
+   the styling says "no answer", never "bad answer". */
+.verdict--unsure {
+    color: var(--text-secondary);
+    background: rgba(148, 163, 184, 0.1);
+    border-color: rgba(148, 163, 184, 0.28);
+}
+
+.verdict + .health-row,
+.verdict + .health-note { margin-top: 0.6rem; }
+
+/* ---- START NEW SCAN ------------------------------------------------------
+   Full width under the two panels: after a scan freezes, this is the only
+   thing left to do, so it should be the obvious thing to press. */
+.btn--scan-again {
+    width: 100%;
+    height: 100%;
+    max-height: 100%;
+    box-sizing: border-box;
+    margin-top: 0.15rem;
+    padding: 0;
+    overflow: hidden;
+    animation: verdict-in 0.34s cubic-bezier(0.2, 0.9, 0.3, 1) 0.08s both;
+    border: 1px solid rgba(115, 246, 180, 0.28);
+    box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.16), 0 16px 32px rgba(6, 182, 212, 0.12);
+    background: linear-gradient(180deg, rgba(14, 57, 44, 0.9), rgba(8, 25, 23, 0.9));
+    text-align: left;
+}
+
+.ai-diagnosis-card {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    max-height: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+    color: var(--text-primary);
+    animation: diagnosis-card-in 0.42s cubic-bezier(0.2, 0.8, 0.3, 1) both;
+}
+
+.ai-diagnosis-content {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 0.7rem 0.7rem 0.45rem;
+    box-sizing: border-box;
+}
+
+.ai-diagnosis-content::-webkit-scrollbar {
+    width: 6px;
+}
+
+.ai-diagnosis-content::-webkit-scrollbar-track {
+    background: rgba(15, 23, 42, 0.45);
+}
+
+.ai-diagnosis-content::-webkit-scrollbar-thumb {
+    background: rgba(52, 211, 153, 0.35);
+    border-radius: 999px;
+}
+
+@keyframes diagnosis-card-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
+}
+
+.diagnosis-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.6rem 0.7rem 0.45rem;
+    border-bottom: 1px solid rgba(125, 211, 252, 0.18);
+    flex: 0 0 auto;
+}
+
+.diagnosis-title {
+    font-size: 0.78rem;
+    line-height: 1.3;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    color: var(--secondary-color);
+}
+
+.diagnosis-status {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.45rem;
+    height: 1.45rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 800;
+    border: 1px solid transparent;
+    flex-shrink: 0;
+}
+
+.status-green {
+    color: #d1fae5;
+    background: rgba(16, 185, 129, 0.18);
+    border-color: rgba(16, 185, 129, 0.38);
+}
+
+.status-red {
+    color: #fee2e2;
+    background: rgba(239, 68, 68, 0.18);
+    border-color: rgba(239, 68, 68, 0.38);
+}
+
+.diagnosis-summary {
+    display: grid;
+    gap: 0.35rem;
+    padding: 0.45rem 0.1rem 0.55rem;
+}
+
+.diagnosis-summary__label,
+.diagnosis-label,
+.diagnosis-meta__label {
+    font-size: 0.64rem;
+    line-height: 1.3;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    text-transform: uppercase;
+}
+
+.diagnosis-summary__value {
+    font-size: 1rem;
+    line-height: 1.35;
+    font-weight: 700;
+    color: #ecfeff;
+    word-break: break-word;
+}
+
+.diagnosis-meta-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.5rem;
+    margin-top: 0.2rem;
+}
+
+.diagnosis-meta {
+    display: grid;
+    gap: 0.2rem;
+}
+
+.severity-badge,
+.confidence-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: fit-content;
+    max-width: 100%;
+    min-height: 1.45rem;
+    padding: 0.22rem 0.42rem;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    line-height: 1.2;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    border: 1px solid transparent;
+}
+
+.severity--high {
+    color: #fee2e2;
+    background: rgba(239, 68, 68, 0.14);
+    border-color: rgba(239, 68, 68, 0.35);
+}
+
+.severity--med {
+    color: #fef3c7;
+    background: rgba(245, 158, 11, 0.14);
+    border-color: rgba(245, 158, 11, 0.32);
+}
+
+.severity--low {
+    color: #d1fae5;
+    background: rgba(16, 185, 129, 0.14);
+    border-color: rgba(16, 185, 129, 0.32);
+}
+
+.confidence-pill--warn {
+    color: #fee2e2;
+    background: rgba(239, 68, 68, 0.14);
+    border-color: rgba(239, 68, 68, 0.26);
+}
+
+.confidence-pill--green {
+    color: #d1fae5;
+    background: rgba(16, 185, 129, 0.16);
+    border-color: rgba(16, 185, 129, 0.26);
+}
+
+.diagnosis-section {
+    margin-top: 0.7rem;
+    padding-top: 0.45rem;
+    border-top: 1px solid rgba(125, 211, 252, 0.12);
+}
+
+.diagnosis-list,
+.recommendation-list {
+    list-style: none;
+    margin: 0.45rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.28rem;
+}
+
+.diagnosis-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.45rem;
+    padding: 0.28rem 0.35rem;
+    border-radius: 0.45rem;
+    background: rgba(14, 25, 35, 0.26);
+    border: 1px solid rgba(103, 232, 249, 0.08);
+    animation: diagnosis-card-in 0.32s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+
+.diagnosis-reason {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-width: 0;
+    font-size: 0.66rem;
+    line-height: 1.35;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+
+.diagnosis-emoji {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 0.75rem;
+    height: 0.75rem;
+    font-size: 0.66rem;
+    color: var(--secondary-color);
+    flex-shrink: 0;
+}
+
+.diagnosis-confidence {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 2.3rem;
+    padding: 0.16rem 0.28rem;
+    border-radius: 999px;
+    font-size: 0.62rem;
+    line-height: 1.2;
+    font-weight: 800;
+    flex-shrink: 0;
+}
+
+.diag-red { color: #fecaca; background: rgba(239, 68, 68, 0.18); }
+.diag-amber { color: #fef3c7; background: rgba(245, 158, 11, 0.16); }
+.diag-green { color: #d1fae5; background: rgba(16, 185, 129, 0.16); }
+
+.recommendation-block {
+    padding: 0.45rem 0.55rem;
+    border-radius: var(--radius-sm);
+    background: rgba(10, 84, 69, 0.2);
+    border: 1px solid rgba(52, 211, 153, 0.18);
+}
+
+.recommendation-list li {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.4rem;
+    font-size: 0.68rem;
+    line-height: 1.35;
+    color: #dcfce7;
+}
+
+.recommendation-icon {
+    color: var(--primary-color);
+    font-size: 0.68rem;
+    margin-top: 0.1rem;
+    flex-shrink: 0;
+}
+
+.diagnosis-env {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.28rem;
+    margin-top: 0.45rem;
+}
+
+.diagnosis-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2rem;
+    padding: 0.18rem 0.32rem;
+    border-radius: 999px;
+    background: rgba(125, 211, 252, 0.08);
+    border: 1px solid rgba(125, 211, 252, 0.18);
+    color: var(--text-primary);
+    font-size: 0.58rem;
+    line-height: 1.3;
+}
+
+.diagnosis-footer {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.42rem;
+    padding: 0.5rem 0.7rem 0.6rem;
+    border-top: 1px solid rgba(125, 211, 252, 0.14);
+    font-size: 0.68rem;
+    line-height: 1.2;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--secondary-color);
+    flex: 0 0 auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .scan-bar,
+    .scan-bar-title,
+    .scan-pulse,
+    .verdict,
+    .btn--scan-again,
+    .ai-diagnosis-card,
+    .diagnosis-row { animation: none; }
+    .scan-ring-bar { transition: none; }
 }

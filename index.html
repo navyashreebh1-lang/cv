@@ -86,8 +86,27 @@
                      (see UIManager.updateNoPlantPopup). Hidden by default. -->
                 <div id="noPlantPopup" class="no-plant-popup" hidden role="alert">
                     <div class="no-plant-icon" aria-hidden="true">⚠️</div>
-                    <div class="no-plant-title">NO PLANT DETECTED</div>
-                    <div class="no-plant-message">Please show a plant to the camera.</div>
+                    <div class="no-plant-title">PLANT NOT VISIBLE</div>
+                    <div class="no-plant-message">Please keep the plant inside the frame.</div>
+                </div>
+
+                <!-- Scan progress. Anchored to the BOTTOM of the camera area on
+                     purpose: the whole point of the scan is that the operator
+                     keeps the plant framed, so nothing may cover the subject.
+                     The ring is the elapsed fraction of the window, the number
+                     is seconds remaining, and the hint switches to a prompt if
+                     the plant leaves the frame for long enough to matter. -->
+                <div id="scanBar" class="scan-bar" hidden role="status" aria-live="polite">
+                    <svg class="scan-ring" viewBox="0 0 44 44" width="40" height="40"
+                         aria-hidden="true" focusable="false">
+                        <circle class="scan-ring-track" cx="22" cy="22" r="18"></circle>
+                        <circle class="scan-ring-bar" id="scanRingBar" cx="22" cy="22" r="18"></circle>
+                    </svg>
+                    <div class="scan-bar-text">
+                        <div class="scan-bar-title">SCANNING PLANT…</div>
+                        <div class="scan-bar-hint" id="scanBarHint">Analyzing plant health…</div>
+                    </div>
+                    <div class="scan-bar-count" id="scanBarCount">20s</div>
                 </div>
             </div>
 
@@ -106,13 +125,13 @@
                     <span class="btn-icon" aria-hidden="true">⏹</span>
                     <span class="btn-text">STOP CAMERA</span>
                 </button>
-                <button id="startDetectionBtn" class="btn btn-success" aria-label="Start detection" disabled>
+                <button id="startDetectionBtn" class="btn btn-success" aria-label="Start scan" disabled>
                     <span class="btn-icon" aria-hidden="true">⚡</span>
-                    <span class="btn-text">START DETECTION</span>
+                    <span class="btn-text">START SCAN</span>
                 </button>
-                <button id="stopDetectionBtn" class="btn btn-danger" aria-label="Stop detection" disabled>
+                <button id="stopDetectionBtn" class="btn btn-danger" aria-label="Cancel scan" disabled>
                     <span class="btn-icon" aria-hidden="true">◼</span>
-                    <span class="btn-text">STOP DETECTION</span>
+                    <span class="btn-text">CANCEL SCAN</span>
                 </button>
             </div>
 
@@ -140,19 +159,13 @@
                                   stroke-linecap="round" opacity=".65"/>
                         </svg>PLANT DETECTION</h3>
                 </div>
+                <!-- Filled by UIManager.detectionMarkup(). One line, three
+                     possible states: an invitation to scan, scan progress, or
+                     the frozen verdict. The live plant COUNT and per-frame
+                     confidence that used to sit here were frame-by-frame
+                     values - exactly what the scan replaces. -->
                 <div class="detection-summary" id="detectionSummary" role="status" aria-live="polite">
-                    <div class="summary-indicator offline">
-                        <span class="indicator-dot"></span>
-                        <span class="indicator-text">NO PLANT DETECTED</span>
-                    </div>
-                    <div class="summary-stat summary-stat--headline">
-                        <span class="summary-label">Plants Detected</span>
-                        <span class="summary-value" id="plantCountValue">0</span>
-                    </div>
-                    <div class="summary-stat">
-                        <span class="summary-label">Confidence</span>
-                        <span class="summary-value" id="confidenceValue">--</span>
-                    </div>
+                    <div class="health-note">Press <strong>START SCAN</strong> to analyse a plant.</div>
                 </div>
             </div>
 
@@ -183,10 +196,22 @@
                     <path d="M45 93c1-14 5-27 11-37M67 79c-3-12-1-25 3-35"
                           fill="none" stroke="currentColor" stroke-width="1.6" opacity=".75"/>
                 </svg>
+                <!-- Filled by UIManager.healthMarkup(). HEALTHY / UNHEALTHY
+                     with the model's own confidence, or an explicit
+                     SCAN INCONCLUSIVE. No crop name, no disease name. -->
                 <div class="health-body" id="plantHealth" role="status" aria-live="polite">
-                    <div class="health-note">Waiting for plant detection…</div>
+                    <div class="health-note">Waiting for a scan…</div>
                 </div>
             </div>
+
+            <!-- Shown only once a scan has produced a verdict. The result is
+                 frozen until this is pressed, so this button IS the way out of
+                 a finished scan. -->
+            <button id="startNewScanBtn" class="btn btn-success btn--scan-again"
+                    aria-label="Start a new scan" hidden>
+                <span class="btn-icon" aria-hidden="true">↻</span>
+                <span class="btn-text">START NEW SCAN</span>
+            </button>
         </div>
     </main>
 
